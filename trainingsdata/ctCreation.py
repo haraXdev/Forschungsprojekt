@@ -5,9 +5,10 @@ from scipy.ndimage import gaussian_filter
 import napari
 from datetime import datetime, timezone
 import json
+import nibabel as nib
 
 # ---------------- CONFIG ----------------
-MESH_FILE = "stl_objects/Motor HAT-V3.stl"  # deine Datei
+MESH_FILE = "./test2.stl"  # deine Datei
 VOL_SIZE = 256
 GAUSS_BLUR = (0.6,0.6,0.6)
 NOISE_STD = 0.005
@@ -83,35 +84,36 @@ def generate_sample():
         used_materials.append("aluminum")
         mat_id_counter += 1
 
-    # ---------------- Zufällige zusätzliche Formen ----------------
-    extra_count = np.random.randint(2,5)
-    for i in range(extra_count):
-        mats = [m for m in MATERIALS.keys() if m not in used_materials and m!="air"]
-        if not mats: break
-        mat = np.random.choice(mats)
-        used_materials.append(mat)
-        mu = MATERIALS[mat]
-        mat_id = mat_id_counter
-        mat_id_counter += 1
 
-        shape_type = np.random.choice(["ellipsoid","block","sphere","cylinder"])
-        center = tuple(np.random.uniform(-60,60,3))
-        alpha = np.random.uniform(0.3,1.0)
+    # # ---------------- Zufällige zusätzliche Formen ----------------
+    # extra_count = np.random.randint(2,5)
+    # for i in range(extra_count):
+    #     mats = [m for m in MATERIALS.keys() if m not in used_materials and m!="air"]
+    #     if not mats: break
+    #     mat = np.random.choice(mats)
+    #     used_materials.append(mat)
+    #     mu = MATERIALS[mat]
+    #     mat_id = mat_id_counter
+    #     mat_id_counter += 1
 
-        if shape_type=="ellipsoid":
-            radii = tuple(np.random.uniform(10,40,3))
-            add_ellipsoid(label, vol, center, radii, mat_id, mu, alpha)
-        elif shape_type=="block":
-            size = tuple(np.random.uniform(10,50,3))
-            add_block(label, vol, center, size, mat_id, mu, alpha)
-        elif shape_type=="sphere":
-            radius = np.random.uniform(5,30)
-            add_sphere(label, vol, center, radius, mat_id, mu, alpha)
-        elif shape_type=="cylinder":
-            radius = np.random.uniform(5,25)
-            height = np.random.uniform(10,50)
-            axis = np.random.choice(["x","y","z"])
-            add_cylinder(label, vol, center, radius, height, axis, mat_id, mu, alpha)
+    #     shape_type = np.random.choice(["ellipsoid","block","sphere","cylinder"])
+    #     center = tuple(np.random.uniform(-60,60,3))
+    #     alpha = np.random.uniform(0.3,1.0)
+
+    #     if shape_type=="ellipsoid":
+    #         radii = tuple(np.random.uniform(10,40,3))
+    #         add_ellipsoid(label, vol, center, radii, mat_id, mu, alpha)
+    #     elif shape_type=="block":
+    #         size = tuple(np.random.uniform(10,50,3))
+    #         add_block(label, vol, center, size, mat_id, mu, alpha)
+    #     elif shape_type=="sphere":
+    #         radius = np.random.uniform(5,30)
+    #         add_sphere(label, vol, center, radius, mat_id, mu, alpha)
+    #     elif shape_type=="cylinder":
+    #         radius = np.random.uniform(5,25)
+    #         height = np.random.uniform(10,50)
+    #         axis = np.random.choice(["x","y","z"])
+    #         add_cylinder(label, vol, center, radius, height, axis, mat_id, mu, alpha)
 
     # ---------------- Gaussian Blur + Rauschen ----------------
     vol = gaussian_filter(vol, sigma=GAUSS_BLUR)
@@ -135,8 +137,17 @@ if __name__=="__main__":
     vol, lbl, meta = generate_sample()
 
     os.makedirs("synthetic_ct_dataset", exist_ok=True)
-    np.savez_compressed("synthetic_ct_dataset/sample_with_submeshes.npz",
-                        volume=vol, label=lbl, meta=json.dumps(meta))
+
+    affine = np.eye(4)  # 1mm isotrope Voxel, keine Rotation
+
+    vol_nii = nib.Nifti1Image(vol.astype(np.float32), affine)
+    lbl_nii = nib.Nifti1Image(lbl.astype(np.uint16), affine)
+
+    vol_nii.header.set_xyzt_units('mm')
+    lbl_nii.header.set_xyzt_units('mm')
+
+    nib.save(vol_nii, "synthetic_ct_dataset/sample_volume.nii.gz")
+    nib.save(lbl_nii, "synthetic_ct_dataset/sample_labels.nii.gz")
 
     # Napari visualisieren
     viewer = napari.Viewer(ndisplay=3)
