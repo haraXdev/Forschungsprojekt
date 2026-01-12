@@ -1,20 +1,44 @@
+"""
+trainer_instance_click_unet_full.py
+
+This version FIXES your current script so it works with your data where:
+- each CT has variable instance ids (0..N), and ids are independent across CTs
+- therefore "num_classes" / "K click channels" is NOT valid
+
+What it trains:
+    (CT + click prompt) -> binary mask of the clicked instance
+
+Input channels: 2  (CT + pos-click map)
+Output channels: 2 (background vs object)
+
+Data layout (nnU-Net raw, as you generated):
+  <data_root>/
+    imagesTr/
+      case_0000_0000.nii.gz
+      case_0001_0000.nii.gz
+      ...
+    labelsTr/
+      case_0000.nii.gz
+      case_0001.nii.gz
+      ...
+
+Run:
+  python trainer_instance_click_unet_full.py
+"""
+
 import os, glob, random
-import numpy as np
 import torch
-from monai.transforms import ScaleIntensityd
 from torch.utils.data import DataLoader
-from monai.data import list_data_collate
 
 from monai.transforms import (
-    Compose, LoadImaged, EnsureChannelFirstd, Orientationd, Spacingd,
-    ScaleIntensityRanged, EnsureTyped, RandFlipd, RandRotate90d,
-    RandCropByPosNegLabeld
+    Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
+    EnsureTyped, RandFlipd, RandRotate90d, RandCropByPosNegLabeld,
+    ScaleIntensityd
 )
-from monai.data import CacheDataset, Dataset
+from monai.data import CacheDataset, list_data_collate
 from monai.networks.nets import UNet
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
-from monai.inferers import sliding_window_inference
 
 
 # -------------------------
@@ -39,100 +63,140 @@ def gaussian_map_3d(shape, points, sigma, device):
     return out
 
 
-class AddClickChannels(torch.nn.Module):
+# -------------------------
+# 2) Instance click sampler
+# -------------------------
+class InstanceClickSampler(torch.nn.Module):
     """
-    Adds K click channels based on GT labels:
-      input: image (1,D,H,W), label (1,D,H,W) with ints {0..K}
-      output: image_with_clicks (1+K,D,H,W), label unchanged
+    Creates training pairs for instance-based interactive segmentation.
+
+    Input:
+      image: (1, D, H, W)  float
+      label: (1, D, H, W)  int instance ids (0..N), N varies per volume
+
+    Output:
+      x: (2, D, H, W)   = [CT, click_map]
+      y: (1, D, H, W)   = binary target for ONE chosen instance (0/1)
     """
-    def __init__(self, num_classes: int, sigma: float = 3.0, max_clicks_per_class: int = 3,
-                 p_zero_click_class: float = 0.2):
+
+    def __init__(self, sigma: float = 3.0, max_clicks: int = 3, p_no_click: float = 0.0):
         super().__init__()
-        self.K = num_classes
-        self.sigma = sigma
-        self.max_clicks = max_clicks_per_class
-        self.p_zero = p_zero_click_class
+        self.sigma = float(sigma)
+        self.max_clicks = int(max_clicks)
+        self.p_no_click = float(p_no_click)
 
     def forward(self, image: torch.Tensor, label: torch.Tensor):
-        # image: (1,D,H,W), label: (1,D,H,W)
         device = image.device
-        _, D, H, W = image.shape
-
         lbl = label[0].long()  # (D,H,W)
-        click_ch = []
 
-        for k in range(1, self.K + 1):
-            # sometimes simulate "no clicks for this class"
-            if random.random() < self.p_zero:
-                pts = []
-            else:
-                idx = (lbl == k).nonzero(as_tuple=False)
-                if idx.numel() == 0:
-                    pts = []
-                else:
-                    n = random.randint(1, self.max_clicks)
-                    # sample points from voxels of class k
-                    sel = idx[torch.randint(0, idx.shape[0], (n,))]
-                    pts = [(int(z), int(y), int(x)) for z, y, x in sel]
+        # Find instance ids present (ignore background=0)
+        ids = torch.unique(lbl)
+        ids = ids[ids != 0]
+        if ids.numel() == 0:
+            return None, None  # no object in this patch
 
-            m = gaussian_map_3d((D, H, W), pts, sigma=self.sigma, device=device)  # (D,H,W)
-            click_ch.append(m)
+        # Pick one instance id from this patch
+        t = ids[torch.randint(0, ids.numel(), (1,), device=device)].item()
 
-        clicks = torch.stack(click_ch, dim=0)  # (K,D,H,W)
-        out = torch.cat([image, clicks], dim=0)  # (1+K,D,H,W)
-        return out, label
+        # Binary GT for the chosen instance
+        y = (lbl == t).long().unsqueeze(0)  # (1,D,H,W) with {0,1}
+
+        # Optionally simulate "no clicks"
+        if self.p_no_click > 0.0 and random.random() < self.p_no_click:
+            D, H, W = y.shape[1:]
+            click = torch.zeros((1, D, H, W), device=device, dtype=torch.float32)
+            x = torch.cat([image, click], dim=0)  # (2,D,H,W)
+            return x, y
+
+        # Sample 1..max_clicks clicks inside chosen instance
+        idx = (y[0] == 1).nonzero(as_tuple=False)
+        if idx.numel() == 0:
+            return None, None
+
+        n = random.randint(1, self.max_clicks)
+        sel = idx[torch.randint(0, idx.shape[0], (n,), device=device)]
+        pts = [(int(z), int(y_), int(x)) for z, y_, x in sel]
+
+        D, H, W = y.shape[1:]
+        click_map = gaussian_map_3d((D, H, W), pts, sigma=self.sigma, device=device).unsqueeze(0)
+
+        # Final net input: CT + click map
+        x = torch.cat([image, click_map], dim=0)  # (2,D,H,W)
+        return x, y
 
 
 # -------------------------
-# 2) Dataset listing
+# 3) Dataset listing (nnU-Net naming)
 # -------------------------
 def make_pairs(images_dir, labels_dir):
-    imgs = sorted(glob.glob(os.path.join(images_dir, "*.nii.gz*")))
+    """
+    imagesTr and labelsTr contain IDENTICAL filenames:
+      imagesTr/0000_0000.nii.gz
+      labelsTr/0000_0000.nii.gz
+    """
+    imgs = sorted(glob.glob(os.path.join(images_dir, "*.nii*")))
+    if len(imgs) == 0:
+        raise RuntimeError(f"No NIfTI files found in {images_dir}")
+
     data = []
     for img in imgs:
         base = os.path.basename(img)
         lbl = os.path.join(labels_dir, base)
+
         if not os.path.exists(lbl):
             raise FileNotFoundError(f"Label missing for {img}: expected {lbl}")
+
         data.append({"image": img, "label": lbl})
+
     return data
 
 
 # -------------------------
-# 3) Main training
+# 4) Main training
 # -------------------------
 def train(
-    data_root="data",
-    num_classes=4,              # K (labels 1..K)
+    data_root,
     patch_size=(128, 128, 128),
     batch_size=1,
-    epochs=100,
+    epochs=50,
     lr=1e-4,
-    device="cuda"
+    device="cuda",
+    sigma=3.0,
+    max_clicks=3,
+    p_no_click=0.0,
+    cache_rate=0.2,
 ):
-    train_files = make_pairs(f"{data_root}/imagesTr", f"{data_root}/labelsTr")
+    train_files = make_pairs(
+        os.path.join(data_root, "imagesTr"),
+        os.path.join(data_root, "labelsTr"),
+    )
+    if len(train_files) == 0:
+        raise RuntimeError("No training files found. Check your data_root/imagesTr path.")
 
-    # simple split
+    # Split (never make train empty)
     random.shuffle(train_files)
-    n_val = max(1, int(0.2 * len(train_files)))
-    val_files = train_files[:n_val]
-    train_files = train_files[n_val:]
+    if len(train_files) < 2:
+        val_files = train_files
+        train_split = train_files
+    else:
+        n_val = max(1, int(0.2 * len(train_files)))
+        val_files = train_files[:n_val]
+        train_split = train_files[n_val:] if len(train_files[n_val:]) > 0 else train_files
 
-    # base transforms (load + normalize + patch crop)
+    print(f"Found total: {len(train_files)} | train: {len(train_split)} | val: {len(val_files)}")
+
     base_tf = Compose([
         LoadImaged(keys=["image", "label"]),
         EnsureChannelFirstd(keys=["image", "label"]),
         Orientationd(keys=["image", "label"], axcodes="RAS"),
-        # optional: set spacing if your industrial CT needs it; otherwise remove Spacingd
-        # Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
-        ScaleIntensityd(keys=["image"]),          
+        ScaleIntensityd(keys=["image"]),
         EnsureTyped(keys=["image", "label"]),
         RandCropByPosNegLabeld(
             keys=["image", "label"],
             label_key="label",
             spatial_size=patch_size,
-            pos=1, neg=1,
-            num_samples=1,   # one patch per volume per iteration
+            pos=3, neg=1,
+            num_samples=2,     # <--- more patches per volume helps a lot
             image_key="image",
             image_threshold=0
         ),
@@ -142,17 +206,16 @@ def train(
         RandRotate90d(keys=["image", "label"], prob=0.2, max_k=3),
     ])
 
-    # datasets
-    train_ds = CacheDataset(train_files, transform=base_tf, cache_rate=0.2, num_workers=2)
-    val_ds   = CacheDataset(val_files,   transform=base_tf, cache_rate=0.2, num_workers=2)
+    train_ds = CacheDataset(train_split, transform=base_tf, cache_rate=cache_rate, num_workers=0)
+    val_ds   = CacheDataset(val_files,  transform=base_tf, cache_rate=cache_rate, num_workers=0)
 
     train_loader = DataLoader(
-    train_ds,
-    batch_size=batch_size,
-    shuffle=True,
-    num_workers=0,
-    pin_memory=False,
-    collate_fn=list_data_collate,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=list_data_collate,
     )
 
     val_loader = DataLoader(
@@ -163,11 +226,12 @@ def train(
         pin_memory=False,
         collate_fn=list_data_collate,
     )
-    # model
+
+    # Binary model: BG vs clicked instance
     model = UNet(
         spatial_dims=3,
-        in_channels=1 + num_classes,   # CT + K click channels
-        out_channels=num_classes + 1,  # BG + K
+        in_channels=2,   # CT + click map
+        out_channels=2,  # BG vs OBJ
         channels=(32, 64, 128, 256),
         strides=(2, 2, 2),
         num_res_units=2,
@@ -177,65 +241,72 @@ def train(
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     dice_metric = DiceMetric(include_background=False, reduction="mean")
-
-    click_adder = AddClickChannels(
-        num_classes=num_classes,
-        sigma=3.0,
-        max_clicks_per_class=3,
-        p_zero_click_class=0.3,   # wichtig: lernt auch mit "fehlenden" clicks klarzukommen
-    )
+    click_sampler = InstanceClickSampler(sigma=sigma, max_clicks=max_clicks, p_no_click=p_no_click)
 
     best = -1.0
 
     for epoch in range(1, epochs + 1):
+        # ---------------- TRAIN ----------------
         model.train()
         epoch_loss = 0.0
+        steps = 0
 
         for batch in train_loader:
             img = batch["image"].to(device)  # (B,1,D,H,W)
             lbl = batch["label"].to(device)  # (B,1,D,H,W)
 
-            # add clicks per sample in batch
             xs, ys = [], []
             for b in range(img.shape[0]):
-                x, y = click_adder(img[b], lbl[b])
+                x, y = click_sampler(img[b], lbl[b])
+                if x is None:
+                    continue
                 xs.append(x)
                 ys.append(y)
-            x = torch.stack(xs, dim=0)  # (B,1+K,D,H,W)
+
+            if len(xs) == 0:
+                continue
+
+            x = torch.stack(xs, dim=0)  # (B,2,D,H,W)
             y = torch.stack(ys, dim=0)  # (B,1,D,H,W)
 
             opt.zero_grad(set_to_none=True)
-            logits = model(x)
+            logits = model(x)           # (B,2,D,H,W)
             loss = loss_fn(logits, y)
             loss.backward()
             opt.step()
 
-            epoch_loss += float(loss)
+            epoch_loss += loss.detach().item()
+            steps += 1
 
-        epoch_loss /= max(1, len(train_loader))
+        epoch_loss /= max(1, steps)
 
-        # validation (simple)
+        # ---------------- VAL ----------------
         model.eval()
         dice_metric.reset()
+
         with torch.no_grad():
             for batch in val_loader:
                 img = batch["image"].to(device)
                 lbl = batch["label"].to(device)
 
-                # For val: you can simulate a few clicks too (or set all to zero).
-                xs = []
+                xs, ys = [], []
                 for b in range(img.shape[0]):
-                    x, _ = click_adder(img[b], lbl[b])
+                    x, y = click_sampler(img[b], lbl[b])
+                    if x is None:
+                        continue
                     xs.append(x)
+                    ys.append(y)
+
+                if len(xs) == 0:
+                    continue
+
                 x = torch.stack(xs, dim=0)
+                y = torch.stack(ys, dim=0)
 
-                # patch-based inference if needed (optional for small patches)
-                pred = model(x)
-                pred = torch.softmax(pred, dim=1)
+                pred = torch.softmax(model(x), dim=1)  # (B,2,D,H,W)
+                dice_metric(y_pred=pred, y=y)
 
-                dice_metric(y_pred=pred, y=lbl)
-
-            mean_dice = dice_metric.aggregate().item()
+            mean_dice = float(dice_metric.aggregate().item())
 
         print(f"Epoch {epoch:03d} | loss={epoch_loss:.4f} | val_dice={mean_dice:.4f}")
 
@@ -243,22 +314,22 @@ def train(
             best = mean_dice
             torch.save(
                 {"epoch": epoch, "model_state": model.state_dict(), "best_dice": best},
-                "best_click_unet.pth"
+                "best_instance_click_unet.pth"
             )
 
-    print(f"Best val dice: {best:.4f} (saved to best_click_unet.pth)")
+    print(f"Best val dice: {best:.4f} (saved to best_instance_click_unet.pth)")
 
-#Er lernt grade die labels global, zB wie sieht IMMER LABEL 3 ? 
-#Wir brauchen aber segmentierung pro objekt nach labels. Label 3 in einem Bild ist nicht gleich einem 
-#anderen Label 3 in einem anderen Bild.
 
 if __name__ == "__main__":
     train(
-        data_root="C:/uniDev/forschungsprojekt/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic",  # <-- set your data path here
-        num_classes=10,        # <-- set K here
-        patch_size=(128,128,128),
+        data_root=r"C:/uniDev/forschungsprojekt/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic",
+        patch_size=(128, 128, 128),
         batch_size=1,
         epochs=50,
         lr=1e-4,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        sigma=3.0,
+        max_clicks=3,
+        p_no_click=0.0,
+        cache_rate=0.2,
     )
