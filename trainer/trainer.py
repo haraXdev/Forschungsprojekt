@@ -248,6 +248,9 @@ def train(
 
     print(f"Best val dice: {best:.4f} (saved to best_click_unet.pth)")
 
+#Er lernt grade die labels global, zB wie sieht IMMER LABEL 3 ? 
+#Wir brauchen aber segmentierung pro objekt nach labels. Label 3 in einem Bild ist nicht gleich einem 
+#anderen Label 3 in einem anderen Bild.
 
 if __name__ == "__main__":
     train(
