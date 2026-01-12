@@ -1,7 +1,9 @@
 import os, glob, random
 import numpy as np
 import torch
+from monai.transforms import ScaleIntensityd
 from torch.utils.data import DataLoader
+from monai.data import list_data_collate
 
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, Orientationd, Spacingd,
@@ -85,7 +87,7 @@ class AddClickChannels(torch.nn.Module):
 # 2) Dataset listing
 # -------------------------
 def make_pairs(images_dir, labels_dir):
-    imgs = sorted(glob.glob(os.path.join(images_dir, "*.nii*")))
+    imgs = sorted(glob.glob(os.path.join(images_dir, "*.nii.gz*")))
     data = []
     for img in imgs:
         base = os.path.basename(img)
@@ -123,7 +125,7 @@ def train(
         Orientationd(keys=["image", "label"], axcodes="RAS"),
         # optional: set spacing if your industrial CT needs it; otherwise remove Spacingd
         # Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
-        ScaleIntensityRanged(keys=["image"], a_min=None, a_max=None, b_min=0.0, b_max=1.0, clip=True),
+        ScaleIntensityd(keys=["image"]),          
         EnsureTyped(keys=["image", "label"]),
         RandCropByPosNegLabeld(
             keys=["image", "label"],
@@ -144,9 +146,23 @@ def train(
     train_ds = CacheDataset(train_files, transform=base_tf, cache_rate=0.2, num_workers=2)
     val_ds   = CacheDataset(val_files,   transform=base_tf, cache_rate=0.2, num_workers=2)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(
+    train_ds,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=False,
+    collate_fn=list_data_collate,
+    )
 
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=list_data_collate,
+    )
     # model
     model = UNet(
         spatial_dims=3,
@@ -235,8 +251,8 @@ def train(
 
 if __name__ == "__main__":
     train(
-        data_root="data",
-        num_classes=4,        # <-- set K here
+        data_root="C:/uniDev/forschungsprojekt/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic",  # <-- set your data path here
+        num_classes=10,        # <-- set K here
         patch_size=(128,128,128),
         batch_size=1,
         epochs=50,
