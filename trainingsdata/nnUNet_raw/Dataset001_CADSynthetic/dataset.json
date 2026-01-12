@@ -1,0 +1,28 @@
+{
+  "name": "CADSynthetic",
+  "description": "Synthetic CT-like volumes generated from CAD meshes (per-submesh labels)",
+  "tensorImageSize": "3D",
+  "channel_names": {
+    "0": "CT"
+  },
+  "labels": {
+    "background": 0,
+    "part_01": 1,
+    "part_02": 2,
+    "part_03": 3,
+    "part_04": 4,
+    "part_05": 5,
+    "part_06": 6,
+    "part_07": 7,
+    "part_08": 8,
+    "part_09": 9,
+    "part_10": 10,
+    "part_11": 11,
+    "part_12": 12,
+    "part_13": 13,
+    "part_14": 14
+  },
+  "numTraining": 2,
+  "numTest": 0,
+  "file_ending": ".nii.gz"
+}

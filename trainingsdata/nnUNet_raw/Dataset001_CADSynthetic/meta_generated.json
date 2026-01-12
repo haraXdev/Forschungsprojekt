@@ -1,0 +1,39 @@
+{
+  "case_0000": {
+    "mesh_file": "test.STL",
+    "materials_used": [
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum"
+    ],
+    "material_mu": {
+      "aluminum": 0.2
+    },
+    "timestamp": "2026-01-12T18:54:59.216365+00:00"
+  },
+  "case_0001": {
+    "mesh_file": "test2.stl",
+    "materials_used": [
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum",
+      "aluminum"
+    ],
+    "material_mu": {
+      "aluminum": 0.2
+    },
+    "timestamp": "2026-01-12T18:55:14.361533+00:00"
+  }
+}
