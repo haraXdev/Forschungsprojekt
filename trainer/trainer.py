@@ -1,33 +1,29 @@
 """
-trainer_instance_click_unet_full.py
+trainer_object_boundary_unet_watershed.py
 
-This version FIXES your current script so it works with your data where:
-- each CT has variable instance ids (0..N), and ids are independent across CTs
-- therefore "num_classes" / "K click channels" is NOT valid
+Goal (Option 3 workable variant):
+- Train a standard 3D UNet from CT intensities to predict:
+  (1) object mask (FG vs BG)
+  (2) boundary map between parts
+- At inference: run watershed inside the object to obtain a labeled parts mask (1..K).
+  Labels are arbitrary per volume (no global meaning), but separate parts.
 
-What it trains:
-    (CT + click prompt) -> binary mask of the clicked instance
+Input channels: 1  (CT)
+Output channels: 2 (object_prob, boundary_prob) with sigmoid
 
-Input channels: 2  (CT + pos-click map)
-Output channels: 2 (background vs object)
-
-Data layout (nnU-Net raw, as you generated):
+Data layout (nnU-Net raw):
   <data_root>/
     imagesTr/
       case_0000_0000.nii.gz
-      case_0001_0000.nii.gz
       ...
     labelsTr/
-      case_0000.nii.gz
-      case_0001.nii.gz
-      ...
-
-Run:
-  python trainer_instance_click_unet_full.py
+      case_0000.nii.gz   (0=background, 1..N parts within this sample)
 """
 
 import os, glob, random
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from monai.transforms import (
@@ -37,103 +33,21 @@ from monai.transforms import (
 )
 from monai.data import CacheDataset, list_data_collate
 from monai.networks.nets import UNet
-from monai.losses import DiceCELoss
+from monai.losses import DiceLoss
 from monai.metrics import DiceMetric
 
-
-# -------------------------
-# 1) Click-map generation
-# -------------------------
-def gaussian_map_3d(shape, points, sigma, device):
-    """shape=(D,H,W), points=[(z,y,x), ...] -> (D,H,W) torch float"""
-    D, H, W = shape
-    if len(points) == 0:
-        return torch.zeros((D, H, W), device=device, dtype=torch.float32)
-
-    zz = torch.arange(D, device=device).view(D, 1, 1)
-    yy = torch.arange(H, device=device).view(1, H, 1)
-    xx = torch.arange(W, device=device).view(1, 1, W)
-
-    out = torch.zeros((D, H, W), device=device, dtype=torch.float32)
-    denom = 2.0 * (sigma ** 2)
-
-    for (z, y, x) in points:
-        g = torch.exp(-((zz - z) ** 2 + (yy - y) ** 2 + (xx - x) ** 2) / denom)
-        out = torch.maximum(out, g)  # multiple clicks: keep max
-    return out
+# For watershed postprocess (CPU)
+from scipy import ndimage as ndi
+from skimage.segmentation import watershed
+from monai.transforms import CenterSpatialCropd
+from monai.transforms import CropForegroundd
+from monai.transforms import CropForegroundd, SpatialPadd, CenterSpatialCropd
 
 
 # -------------------------
-# 2) Instance click sampler
-# -------------------------
-class InstanceClickSampler(torch.nn.Module):
-    """
-    Creates training pairs for instance-based interactive segmentation.
-
-    Input:
-      image: (1, D, H, W)  float
-      label: (1, D, H, W)  int instance ids (0..N), N varies per volume
-
-    Output:
-      x: (2, D, H, W)   = [CT, click_map]
-      y: (1, D, H, W)   = binary target for ONE chosen instance (0/1)
-    """
-
-    def __init__(self, sigma: float = 3.0, max_clicks: int = 3, p_no_click: float = 0.0):
-        super().__init__()
-        self.sigma = float(sigma)
-        self.max_clicks = int(max_clicks)
-        self.p_no_click = float(p_no_click)
-
-    def forward(self, image: torch.Tensor, label: torch.Tensor):
-        device = image.device
-        lbl = label[0].long()  # (D,H,W)
-
-        # Find instance ids present (ignore background=0)
-        ids = torch.unique(lbl)
-        ids = ids[ids != 0]
-        if ids.numel() == 0:
-            return None, None  # no object in this patch
-
-        # Pick one instance id from this patch
-        t = ids[torch.randint(0, ids.numel(), (1,), device=device)].item()
-
-        # Binary GT for the chosen instance
-        y = (lbl == t).long().unsqueeze(0)  # (1,D,H,W) with {0,1}
-
-        # Optionally simulate "no clicks"
-        if self.p_no_click > 0.0 and random.random() < self.p_no_click:
-            D, H, W = y.shape[1:]
-            click = torch.zeros((1, D, H, W), device=device, dtype=torch.float32)
-            x = torch.cat([image, click], dim=0)  # (2,D,H,W)
-            return x, y
-
-        # Sample 1..max_clicks clicks inside chosen instance
-        idx = (y[0] == 1).nonzero(as_tuple=False)
-        if idx.numel() == 0:
-            return None, None
-
-        n = random.randint(1, self.max_clicks)
-        sel = idx[torch.randint(0, idx.shape[0], (n,), device=device)]
-        pts = [(int(z), int(y_), int(x)) for z, y_, x in sel]
-
-        D, H, W = y.shape[1:]
-        click_map = gaussian_map_3d((D, H, W), pts, sigma=self.sigma, device=device).unsqueeze(0)
-
-        # Final net input: CT + click map
-        x = torch.cat([image, click_map], dim=0)  # (2,D,H,W)
-        return x, y
-
-
-# -------------------------
-# 3) Dataset listing (nnU-Net naming)
+# 1) Dataset listing
 # -------------------------
 def make_pairs(images_dir, labels_dir):
-    """
-    imagesTr and labelsTr contain IDENTICAL filenames:
-      imagesTr/0000_0000.nii.gz
-      labelsTr/0000_0000.nii.gz
-    """
     imgs = sorted(glob.glob(os.path.join(images_dir, "*.nii*")))
     if len(imgs) == 0:
         raise RuntimeError(f"No NIfTI files found in {images_dir}")
@@ -141,14 +55,118 @@ def make_pairs(images_dir, labels_dir):
     data = []
     for img in imgs:
         base = os.path.basename(img)
-        lbl = os.path.join(labels_dir, base)
 
-        if not os.path.exists(lbl):
-            raise FileNotFoundError(f"Label missing for {img}: expected {lbl}")
+        # nnU-Net often uses labelsTr/case_XXXX.nii.gz while imagesTr has _0000
+        # Try exact match first; if not found, also try stripping "_0000"
+        lbl1 = os.path.join(labels_dir, base)
+        lbl2 = os.path.join(labels_dir, base.replace("_0000", ""))
+
+        if os.path.exists(lbl1):
+            lbl = lbl1
+        elif os.path.exists(lbl2):
+            lbl = lbl2
+        else:
+            raise FileNotFoundError(f"Label missing for {img}: tried {lbl1} and {lbl2}")
 
         data.append({"image": img, "label": lbl})
-
     return data
+
+def weighted_bce(logits, targets, eps=1e-6):
+    pos = targets.sum()
+    neg = targets.numel() - pos
+    pos_weight = (neg / (pos + eps)).clamp(1.0, 100.0)
+    return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+
+# -------------------------
+# 2) Boundary target creation
+# -------------------------
+def make_object_and_boundary_targets(label_1dhw: torch.Tensor):
+    """
+    label_1dhw: (1, D, H, W) int, 0=bg, 1..N=parts
+
+    Returns:
+      obj: (1, D, H, W) float {0,1}
+      bnd: (1, D, H, W) float {0,1}  boundary voxels where neighbor has different label
+    """
+    lbl = label_1dhw[0].long()  # (D,H,W)
+    obj = (lbl > 0).float().unsqueeze(0)
+
+    # boundary = voxel that has at least one 6-neighbor with different label (inside object)
+    # We'll compute differences along each axis and mark boundaries on both sides.
+    bnd = torch.zeros_like(lbl, dtype=torch.bool)
+
+    # z neighbors
+    dz = lbl[1:, :, :] != lbl[:-1, :, :]
+    bnd[1:, :, :] |= dz
+    bnd[:-1, :, :] |= dz
+
+    # y neighbors
+    dy = lbl[:, 1:, :] != lbl[:, :-1, :]
+    bnd[:, 1:, :] |= dy
+    bnd[:, :-1, :] |= dy
+
+    # x neighbors
+    dx = lbl[:, :, 1:] != lbl[:, :, :-1]
+    bnd[:, :, 1:] |= dx
+    bnd[:, :, :-1] |= dx
+
+    # keep boundaries only where object exists (optional but usually helpful)
+    bnd = (bnd & (lbl > 0))
+
+    return obj, bnd.float().unsqueeze(0)
+
+
+# -------------------------
+# 3) Watershed post-process
+# -------------------------
+def parts_from_object_and_boundary(obj_prob: np.ndarray, bnd_prob: np.ndarray,
+                                  obj_thr=0.5, bnd_thr=0.3, min_size=200):
+    """
+    obj_prob: (D,H,W) float
+    bnd_prob: (D,H,W) float
+
+    Returns:
+      parts: (D,H,W) int, 0=bg, 1..K parts
+    """
+    obj = obj_prob > obj_thr
+    if obj.sum() == 0:
+        return np.zeros_like(obj_prob, dtype=np.int32)
+
+    # Treat low-boundary regions as "inside-part" areas; boundaries act like walls.
+    # Compute distance transform inside object but penalize boundaries.
+    # One simple trick: erode object by boundary zones to create seeds.
+    bnd = bnd_prob > bnd_thr
+    interior = obj & (~bnd)
+
+    # Connected components of interior become markers (seeds)
+    markers, n = ndi.label(interior)
+    if n == 0:
+        # fallback: use object as a single part
+        out = obj.astype(np.int32)
+        out[obj] = 1
+        return out
+
+    # Elevation map: boundaries should be high to prevent merging.
+    # Use boundary probability as elevation; add small term to prefer compact splits.
+    elevation = bnd_prob.astype(np.float32)
+
+    # Watershed inside object mask
+    parts = watershed(elevation, markers=markers, mask=obj)
+
+    # Remove tiny regions
+    if min_size > 0:
+        out = np.zeros_like(parts, dtype=np.int32)
+        cur = 0
+        for rid in np.unique(parts):
+            if rid == 0:
+                continue
+            m = parts == rid
+            if m.sum() >= min_size:
+                cur += 1
+                out[m] = cur
+        parts = out
+
+    return parts.astype(np.int32)
 
 
 # -------------------------
@@ -161,175 +179,160 @@ def train(
     epochs=50,
     lr=1e-4,
     device="cuda",
-    sigma=3.0,
-    max_clicks=3,
-    p_no_click=0.0,
     cache_rate=0.2,
 ):
-    train_files = make_pairs(
-        os.path.join(data_root, "imagesTr"),
-        os.path.join(data_root, "labelsTr"),
-    )
-    if len(train_files) == 0:
-        raise RuntimeError("No training files found. Check your data_root/imagesTr path.")
-
-    # Split (never make train empty)
-    random.shuffle(train_files)
-    if len(train_files) < 2:
-        val_files = train_files
-        train_split = train_files
+    files = make_pairs(os.path.join(data_root, "imagesTr"), os.path.join(data_root, "labelsTr"))
+    random.shuffle(files)
+    if len(files) < 2:
+        train_split = files
+        val_files = files
     else:
-        n_val = max(1, int(0.2 * len(train_files)))
-        val_files = train_files[:n_val]
-        train_split = train_files[n_val:] if len(train_files[n_val:]) > 0 else train_files
+        n_val = max(1, int(0.2 * len(files)))
+        #val_files = files[:n_val]
+        #train_split = files[n_val:] if len(files[n_val:]) > 0 else files
+        val_files = files
+        train_split = files
 
-    print(f"Found total: {len(train_files)} | train: {len(train_split)} | val: {len(val_files)}")
 
-    base_tf = Compose([
-        LoadImaged(keys=["image", "label"]),
-        EnsureChannelFirstd(keys=["image", "label"]),
-        Orientationd(keys=["image", "label"], axcodes="RAS"),
-        ScaleIntensityd(keys=["image"]),
-        EnsureTyped(keys=["image", "label"]),
-        RandCropByPosNegLabeld(
-            keys=["image", "label"],
-            label_key="label",
-            spatial_size=patch_size,
-            pos=3, neg=1,
-            num_samples=2,     # <--- more patches per volume helps a lot
-            image_key="image",
-            image_threshold=0
-        ),
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
-        RandRotate90d(keys=["image", "label"], prob=0.2, max_k=3),
-    ])
+    print(f"Found total: {len(files)} | train: {len(train_split)} | val: {len(val_files)}")
 
-    train_ds = CacheDataset(train_split, transform=base_tf, cache_rate=cache_rate, num_workers=0)
-    val_ds   = CacheDataset(val_files,  transform=base_tf, cache_rate=cache_rate, num_workers=0)
+    tf = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    ScaleIntensityd(keys=["image"]),
+    EnsureTyped(keys=["image", "label"]),
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-        collate_fn=list_data_collate,
-    )
+    CropForegroundd(keys=["image", "label"], source_key="label"),   # crop around label
+    SpatialPadd(keys=["image", "label"], spatial_size=patch_size),  # ensure >= patch
+    CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size),
+])
 
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-        collate_fn=list_data_collate,
-    )
 
-    # Binary model: BG vs clicked instance
+    train_ds = CacheDataset(train_split, transform=tf, cache_rate=cache_rate, num_workers=0)
+    val_ds   = CacheDataset(val_files,  transform=tf, cache_rate=cache_rate, num_workers=0)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=0, collate_fn=list_data_collate)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
+                            num_workers=0, collate_fn=list_data_collate)
+
+    # UNet predicts: channel0=object logit, channel1=boundary logit
     model = UNet(
         spatial_dims=3,
-        in_channels=2,   # CT + click map
-        out_channels=2,  # BG vs OBJ
+        in_channels=1,
+        out_channels=2,
         channels=(32, 64, 128, 256),
         strides=(2, 2, 2),
         num_res_units=2,
     ).to(device)
 
-    loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
+    # Losses:
+    # - object: Dice + BCE
+    # - boundary: BCE (Dice for boundaries is often unstable because boundaries are thin)
+    dice_obj = DiceLoss(sigmoid=True)
+    bce = torch.nn.BCEWithLogitsLoss()
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
-    dice_metric = DiceMetric(include_background=False, reduction="mean")
-    click_sampler = InstanceClickSampler(sigma=sigma, max_clicks=max_clicks, p_no_click=p_no_click)
-
+    dice_metric = DiceMetric(include_background=False, reduction="mean")  # for object only
     best = -1.0
 
     for epoch in range(1, epochs + 1):
-        # ---------------- TRAIN ----------------
         model.train()
         epoch_loss = 0.0
         steps = 0
 
         for batch in train_loader:
             img = batch["image"].to(device)  # (B,1,D,H,W)
-            lbl = batch["label"].to(device)  # (B,1,D,H,W)
+            lbl = batch["label"].to(device)  # (B,1,D,H,W) int parts
 
-            xs, ys = [], []
+            # build targets per batch item
+            obj_t, bnd_t = [], []
             for b in range(img.shape[0]):
-                x, y = click_sampler(img[b], lbl[b])
-                if x is None:
-                    continue
-                xs.append(x)
-                ys.append(y)
-
-            if len(xs) == 0:
-                continue
-
-            x = torch.stack(xs, dim=0)  # (B,2,D,H,W)
-            y = torch.stack(ys, dim=0)  # (B,1,D,H,W)
+                o, bd = make_object_and_boundary_targets(lbl[b])
+                obj_t.append(o)
+                bnd_t.append(bd)
+            obj_t = torch.stack(obj_t, dim=0).to(device)  # (B,1,D,H,W)
+            bnd_t = torch.stack(bnd_t, dim=0).to(device)  # (B,1,D,H,W)
 
             opt.zero_grad(set_to_none=True)
-            logits = model(x)           # (B,2,D,H,W)
-            loss = loss_fn(logits, y)
+
+            logits = model(img)  # (B,2,D,H,W)
+            obj_logit = logits[:, 0:1]
+            bnd_logit = logits[:, 1:2]
+
+            if epoch == 1 and steps == 0:
+                print("img shape:", tuple(img.shape), "lbl shape:", tuple(lbl.shape))
+                print("fg_ratio:", (obj_t.sum() / obj_t.numel()).item())
+
+                p = torch.sigmoid(obj_logit)
+                print("prob mean/min/max:",
+                p.mean().item(),
+                p.min().item(),
+                p.max().item())
+
+            loss_obj = dice_obj(obj_logit, obj_t) + weighted_bce(obj_logit, obj_t)
+            loss_bnd = weighted_bce(bnd_logit, bnd_t)
+            loss = loss_obj + 0.5 * loss_bnd  # weight boundary a bit lower
+
             loss.backward()
             opt.step()
 
-            epoch_loss += loss.detach().item()
+            epoch_loss += float(loss.detach().item())
             steps += 1
 
         epoch_loss /= max(1, steps)
 
-        # ---------------- VAL ----------------
+        # -------- VAL (object dice) --------
+        # -------- VAL (hard dice) --------
         model.eval()
-        dice_metric.reset()
+        hard_dices = []
 
         with torch.no_grad():
             for batch in val_loader:
                 img = batch["image"].to(device)
                 lbl = batch["label"].to(device)
 
-                xs, ys = [], []
-                for b in range(img.shape[0]):
-                    x, y = click_sampler(img[b], lbl[b])
-                    if x is None:
-                        continue
-                    xs.append(x)
-                    ys.append(y)
+                obj_t = (lbl > 0).float()                 # (B,1,D,H,W)
+                obj_prob = torch.sigmoid(model(img)[:,0:1])
+                obj_pred = (obj_prob > 0.5).float()
 
-                if len(xs) == 0:
-                    continue
+                inter = (obj_pred * obj_t).sum(dim=(1,2,3,4))
+                denom = obj_pred.sum(dim=(1,2,3,4)) + obj_t.sum(dim=(1,2,3,4))
+                dice = (2 * inter / (denom + 1e-8))
 
-                x = torch.stack(xs, dim=0)
-                y = torch.stack(ys, dim=0)
+                hard_dices.append(dice.mean().item())
 
-                pred = torch.softmax(model(x), dim=1)  # (B,2,D,H,W)
-                dice_metric(y_pred=pred, y=y)
+        mean_dice = float(np.mean(hard_dices))
+        print(f"Epoch {epoch:03d} | loss={epoch_loss:.4f} | val_obj_dice={mean_dice:.4f}")
 
-            mean_dice = float(dice_metric.aggregate().item())
 
-        print(f"Epoch {epoch:03d} | loss={epoch_loss:.4f} | val_dice={mean_dice:.4f}")
-
-        if mean_dice > best:
-            best = mean_dice
-            torch.save(
-                {"epoch": epoch, "model_state": model.state_dict(), "best_dice": best},
-                "best_instance_click_unet.pth"
-            )
-
-    print(f"Best val dice: {best:.4f} (saved to best_instance_click_unet.pth)")
+# -------------------------
+# 5) Example inference usage
+# -------------------------
+@torch.no_grad()
+def infer_parts(model, ct_tensor_1dhw: torch.Tensor, device="cuda"):
+    """
+    ct_tensor_1dhw: (1,D,H,W) torch float
+    Returns:
+      parts_mask: (D,H,W) int32, 0=bg, 1..K parts
+    """
+    model.eval()
+    x = ct_tensor_1dhw.unsqueeze(0).to(device)  # (1,1,D,H,W)
+    logits = model(x)  # (1,2,D,H,W)
+    obj_prob = torch.sigmoid(logits[:, 0:1])[0, 0].detach().cpu().numpy()
+    bnd_prob = torch.sigmoid(logits[:, 1:2])[0, 0].detach().cpu().numpy()
+    return parts_from_object_and_boundary(obj_prob, bnd_prob)
 
 
 if __name__ == "__main__":
     train(
         data_root=r"C:/uniDev/forschungsprojekt/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic",
-        patch_size=(128, 128, 128),
+        patch_size=(64, 64, 64),
         batch_size=1,
-        epochs=50,
-        lr=1e-4,
+        epochs=300,
+        lr=1e-3,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        sigma=3.0,
-        max_clicks=3,
-        p_no_click=0.0,
         cache_rate=0.2,
     )
