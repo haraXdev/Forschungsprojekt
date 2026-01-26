@@ -436,7 +436,7 @@ def train(
 
 if __name__ == "__main__":
     train(
-        data_root=r"C:/uniDev/forschungsprojekt/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic",
+        data_root=r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic",
         out_dir=r"./runs_clickprompts",
         kmax=8,
         patch_size=(64, 64, 64),
