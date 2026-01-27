@@ -1,5 +1,6 @@
 # Ignore all files in the runs_clickprompts directory
-trainer/runs_clickprompts/*
+trainer/runs_clickprompts/
 
-traingsdaten/cads/*
-traingsdaten/nnUnet_raw/*
+# Training data (CADs + nnU-Net output)
+traingsdaten/cads/
+traingsdaten/nnUnet_raw/

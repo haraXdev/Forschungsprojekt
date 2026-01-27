@@ -227,8 +227,8 @@ if __name__ == "__main__":
     print(f"Dataset written to: {dataset_folder}")
 
     # ---------------- Napari-Visualisierung eines Beispiels ----------------
-    print(">>> Launching napari now...")
-    viewer = napari.Viewer(ndisplay=3)
-    viewer.add_image(vol, name="volume", colormap="gray")
-    viewer.add_labels(lbl, name="labels")
-    napari.run()
+    # print(">>> Launching napari now...")
+    # viewer = napari.Viewer(ndisplay=3)
+    # viewer.add_image(vol, name="volume", colormap="gray")
+    # viewer.add_labels(lbl, name="labels")
+    # napari.run()
