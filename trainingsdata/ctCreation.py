@@ -94,10 +94,11 @@ def generate_sample(mesh_file):
         start = [(VOL_SIZE - s) // 2 for s in shape]
         slices = tuple(slice(st, st + s) for st, s in zip(start, shape))
 
-        vol[slices] = voxel.matrix.astype(np.float32) * MATERIALS["aluminum"]
+        mu = np.random.choice([v for k, v in MATERIALS.items() if k != "air"])
+        vol[slices] = voxel.matrix.astype(np.float32) * mu
         label[slices][voxel.matrix] = mat_id_counter
 
-        used_materials.append("aluminum")
+        #used_materials.append("aluminum")
         mat_id_counter += 1
 
     # # ---------------- Zufällige zusätzliche Formen ----------------
@@ -225,9 +226,9 @@ if __name__ == "__main__":
     print("\nDone!")
     print(f"Dataset written to: {dataset_folder}")
 
-    # Optional: visualize the last generated sample in Napari
-    # (keeps your original visualization behavior)
-    # viewer = napari.Viewer(ndisplay=3)
-    # viewer.add_image(vol, name="volume", colormap="gray")
-    # viewer.add_labels(lbl, name="labels")
-    # napari.run()
+    # ---------------- Napari-Visualisierung eines Beispiels ----------------
+    print(">>> Launching napari now...")
+    viewer = napari.Viewer(ndisplay=3)
+    viewer.add_image(vol, name="volume", colormap="gray")
+    viewer.add_labels(lbl, name="labels")
+    napari.run()
