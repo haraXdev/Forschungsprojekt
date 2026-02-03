@@ -108,45 +108,36 @@ def simulate_prompt_and_target_from_parts(
     parts_label_1dhw: torch.Tensor,
     kmax: int = 8,
     k_range=(2, 5),
-    clicks_per_label=(1, 3),
+    clicks_per_label=(5, 10),
     click_radius=(1, 3),
     p_empty=0.05,
 ):
     """
-    parts_label_1dhw: (1,D,H,W) int. 0=bg, 1..N parts
-    Returns:
-      prompt_onehot: (kmax, D, H, W) float {0,1}
-      target_int:   (D, H, W) long in [0..kmax] (dense training target)
-      prompt_int:   (D, H, W) long in [0..kmax] (sparse prompt IDs at clicked voxels)
-    Semantics:
-      - We pick a random subset of GT parts and remap them to labels 1..k (k<=kmax).
-      - Only those chosen parts are "foreground classes" for this iteration.
-      - All other parts become background (0) for this iteration.
+    Deterministic pseudo-random prompts:
+    - Each part ID gets its own RNG seed (seed = part ID)
+    - So the same part always produces the same click pattern
+    - But still multiple clicks, random radii, random positions
     """
-    lbl = parts_label_1dhw[0].detach().cpu().numpy().astype(np.int32)  # (D,H,W)
 
-    # optionally no prompts: train automatic mode too
+    lbl = parts_label_1dhw[0].detach().cpu().numpy().astype(np.int32)
+    D, H, W = lbl.shape
+
+    # optional empty prompt mode
     if np.random.rand() < p_empty:
-        D, H, W = lbl.shape
         prompt_onehot = np.zeros((kmax, D, H, W), dtype=np.float32)
         prompt_int = np.zeros((D, H, W), dtype=np.int64)
-        # In "no prompt" mode, we train object-vs-background union as class 1 (optional).
-        # But that would introduce semantics. So instead we train "background only" which is useless.
-        # Better: still do prompted training mostly. We'll simply return empty prompts and use
-        # a remapped target with k=1 on union object so it learns an auto fallback without semantics:
         target_int = np.zeros((D, H, W), dtype=np.int64)
         target_int[lbl > 0] = 1
-        # set channel for label 1 empty (no clicks), still ok
         return (
             torch.from_numpy(prompt_onehot),
             torch.from_numpy(target_int),
             torch.from_numpy(prompt_int),
         )
 
+    # collect part IDs
     part_ids = np.unique(lbl)
     part_ids = part_ids[part_ids != 0]
     if part_ids.size == 0:
-        D, H, W = lbl.shape
         prompt_onehot = np.zeros((kmax, D, H, W), dtype=np.float32)
         prompt_int = np.zeros((D, H, W), dtype=np.int64)
         target_int = np.zeros((D, H, W), dtype=np.int64)
@@ -162,39 +153,52 @@ def simulate_prompt_and_target_from_parts(
     k = np.random.randint(k_lo, k_hi + 1) if k_hi >= k_lo else k_hi
     chosen = np.random.choice(part_ids, size=k, replace=False)
 
-    # map chosen GT part IDs -> prompt IDs 1..k
+    # map chosen parts to 1..k
     mapping = {int(pid): (i + 1) for i, pid in enumerate(chosen)}
 
-    D, H, W = lbl.shape
+    # build target
     target_int = np.zeros((D, H, W), dtype=np.int64)
     for pid, new_id in mapping.items():
         target_int[lbl == pid] = new_id
 
-    # sparse prompt clicks (integer IDs)
+    # sparse prompt clicks
     prompt_int = np.zeros((D, H, W), dtype=np.int64)
+
     for pid, new_id in mapping.items():
         vox = np.argwhere(lbl == pid)
         if vox.shape[0] == 0:
             continue
-        n_clicks = np.random.randint(clicks_per_label[0], clicks_per_label[1] + 1)
+
+        # deterministic RNG for this part
+        rng = np.random.RandomState(seed=pid)
+
+        # deterministic number of clicks
+        n_clicks = rng.randint(clicks_per_label[0], clicks_per_label[1] + 1)
+
         for _ in range(n_clicks):
-            cz, cy, cx = vox[np.random.randint(vox.shape[0])]
-            r = np.random.randint(click_radius[0], click_radius[1] + 1)
+            # deterministic voxel choice
+            idx = rng.randint(0, vox.shape[0])
+            cz, cy, cx = vox[idx]
+
+            # deterministic radius
+            r = rng.randint(click_radius[0], click_radius[1] + 1)
+
             tmp = np.zeros((D, H, W), dtype=np.uint8)
             _draw_ball_u8(tmp, (int(cz), int(cy), int(cx)), int(r))
-            # write label id where the ball is
             prompt_int[tmp > 0] = new_id
 
-    # one-hot encode prompt into kmax channels
+    # one-hot encode
     prompt_onehot = np.zeros((kmax, D, H, W), dtype=np.float32)
     for c in range(1, kmax + 1):
         prompt_onehot[c - 1] = (prompt_int == c).astype(np.float32)
 
     return (
-        torch.from_numpy(prompt_onehot),      # (kmax,D,H,W)
-        torch.from_numpy(target_int),         # (D,H,W)
-        torch.from_numpy(prompt_int),         # (D,H,W)
+        torch.from_numpy(prompt_onehot),
+        torch.from_numpy(target_int),
+        torch.from_numpy(prompt_int),
     )
+
+
 
 
 def prompt_click_consistency_ce(
@@ -247,16 +251,16 @@ def train(
     files = make_pairs(os.path.join(data_root, "imagesTr"), os.path.join(data_root, "labelsTr"))
     random.shuffle(files)
 
-    train_files = files
-    val_files = files
+    # train_files = files
+    # val_files = files
 
-    # if len(files) < 2:
-    #     train_files = files
-    #     val_files = files
-    # else:
-    #     n_val = max(1, int(0.2 * len(files)))
-    #     val_files = files[:n_val]
-    #     train_files = files[n_val:] if len(files[n_val:]) > 0 else files
+    if len(files) < 2:
+        train_files = files
+        val_files = files
+    else:
+        n_val = max(1, int(0.2 * len(files)))
+        val_files = files[:n_val]
+        train_files = files[n_val:] if len(files[n_val:]) > 0 else files
 
     print(f"Found total: {len(files)} | train: {len(train_files)} | val: {len(val_files)}")
     print(f"KMAX={kmax} -> in_channels={1+kmax}, out_channels={1+kmax}")
@@ -328,9 +332,8 @@ def train(
                 prompt_oh, target_int, prompt_int = simulate_prompt_and_target_from_parts(
                     gt_parts[b],
                     kmax=kmax,
-                    k_range=(2, 5),
-                    clicks_per_label=(1, 3),
-                    click_radius=(1, 3),
+                    k_range=(1, 1),
+                    click_radius=(3,6),
                     p_empty=0.05,
                 )
                 prompt_oh_list.append(prompt_oh)      # (kmax,D,H,W)
@@ -393,8 +396,7 @@ def train(
                             gt_parts[b],
                             kmax=kmax,
                             k_range=(2, 5),
-                            clicks_per_label=(1, 3),
-                            click_radius=(1, 3),
+                            click_radius=(3,6),
                             p_empty=0.05,
                         )
                         prompt_oh_list.append(prompt_oh)
