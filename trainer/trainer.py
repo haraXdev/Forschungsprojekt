@@ -37,7 +37,7 @@ Run:
   python trainer_interactive_labeled_clicks_unet.py
 """
 
-import os, glob, random
+import os, glob, random, re
 import numpy as np
 
 import torch
@@ -74,15 +74,14 @@ def make_pairs(images_dir, labels_dir):
     data = []
     for img in imgs:
         base = os.path.basename(img)
-        lbl1 = os.path.join(labels_dir, base)
-        lbl2 = os.path.join(labels_dir, base.replace("_0000", ""))
 
-        if os.path.exists(lbl1):
-            lbl = lbl1
-        elif os.path.exists(lbl2):
-            lbl = lbl2
-        else:
-            raise FileNotFoundError(f"Label missing for {img}: tried {lbl1} and {lbl2}")
+        # remove ONLY the final "_0000" (or "_0001", etc.) before the extension
+        label_base = re.sub(r'_\d{4}(?=\.nii(\.gz)?$)', '', base)
+
+        lbl = os.path.join(labels_dir, label_base)
+
+        if not os.path.exists(lbl):
+            raise FileNotFoundError(f"Label missing for {img}: expected {lbl}")
 
         data.append({"image": img, "label": lbl})
     return data
@@ -248,13 +247,16 @@ def train(
     files = make_pairs(os.path.join(data_root, "imagesTr"), os.path.join(data_root, "labelsTr"))
     random.shuffle(files)
 
-    if len(files) < 2:
-        train_files = files
-        val_files = files
-    else:
-        n_val = max(1, int(0.2 * len(files)))
-        val_files = files[:n_val]
-        train_files = files[n_val:] if len(files[n_val:]) > 0 else files
+    train_files = files
+    val_files = files
+
+    # if len(files) < 2:
+    #     train_files = files
+    #     val_files = files
+    # else:
+    #     n_val = max(1, int(0.2 * len(files)))
+    #     val_files = files[:n_val]
+    #     train_files = files[n_val:] if len(files[n_val:]) > 0 else files
 
     print(f"Found total: {len(files)} | train: {len(train_files)} | val: {len(val_files)}")
     print(f"KMAX={kmax} -> in_channels={1+kmax}, out_channels={1+kmax}")

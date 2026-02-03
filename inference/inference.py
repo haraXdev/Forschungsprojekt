@@ -16,7 +16,7 @@ MODEL_CHECKPOINT_PATH = Path(
 )
 
 INPUT_IMAGE_PATH = Path(
-    r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic/imagesTr/case_0001_0000.nii.gz"
+    r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic/imagesTr/case_0003_0000.nii.gz"
 )
 
 KMAX = 8
