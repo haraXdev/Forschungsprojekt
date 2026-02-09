@@ -39,7 +39,7 @@ Run:
 
 import os, glob, random, re
 import numpy as np
-import json
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 import torch.nn.functional as F
@@ -241,6 +241,11 @@ def train(
     set_seed(seed)
     os.makedirs(out_dir, exist_ok=True)
 
+    tb_dir = os.path.join(out_dir, "tb")
+    writer = SummaryWriter(log_dir=tb_dir)
+
+    writer.add_text("hparams", f"kmax={kmax}, patch_size={patch_size}, lr={lr}, prompt_ce_w={prompt_ce_w}")
+
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
@@ -311,15 +316,6 @@ def train(
 
     best_val = -1.0
 
-    #logging
-
-    history = {
-        "epoch": [],
-        "train_loss": [],
-        "val_fg_union_dice": [],
-    }
-    history_path = os.path.join(out_dir, "history.json")
-
     for epoch in range(1, epochs + 1):
         # ---------- TRAIN ----------
         model.train()
@@ -383,12 +379,19 @@ def train(
                           torch.unique(pred[0]).detach().cpu().numpy()[:20])
 
         epoch_loss /= max(1, steps)
+        #logging
+        writer.add_scalar("loss/train", epoch_loss, epoch)
+
+        mean_dice_fg = None
 
         # ---------- VAL ----------
         mean_dice_fg = None
         if (epoch % val_every) == 0:
             model.eval()
             dices = []
+
+            val_losses = []
+
 
             with torch.no_grad():
                 for batch in val_loader:
@@ -417,6 +420,12 @@ def train(
                     x = torch.cat([ct, prompt_oh], dim=1)
 
                     logits = model(x)
+
+                    # seg loss on val (same as train)
+                    val_target_int = target_int.unsqueeze(1)  # (B,1,D,H,W)
+                    loss_v = seg_loss(logits, val_target_int)
+                    val_losses.append(float(loss_v.item()))
+
                     pred = torch.argmax(logits, dim=1)  # (B,D,H,W)
 
                     # Evaluate foreground union dice: (pred>0) vs (target>0)
@@ -429,21 +438,16 @@ def train(
 
             mean_dice_fg = float(np.mean(dices)) if len(dices) else 0.0
 
+            mean_val_loss = float(np.mean(val_losses)) if len(val_losses) else 0.0
+            writer.add_scalar("loss/val", mean_val_loss, epoch)
+            writer.add_scalar("dice/val_fg_union", mean_dice_fg, epoch)
+
         msg = f"Epoch {epoch:03d} | loss={epoch_loss:.4f}"
         if mean_dice_fg is not None:
-            msg += f" | val_fg_union_dice={mean_dice_fg:.4f}"
+            msg += f" | val_loss={mean_val_loss:.4f} | val_fg_union_dice={mean_dice_fg:.4f}"
         print(msg)
 
-        #Logging
-
-        history["epoch"].append(int(epoch))
-        history["train_loss"].append(float(epoch_loss))
-        history["val_fg_union_dice"].append(None if mean_dice_fg is None else float(mean_dice_fg))
-
-        # saving the epoch so that it can be inpspected during training
-        with open(history_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
-
+        
         # ---------- SAVE ----------
         if (epoch % save_every) == 0 or epoch == epochs:
             ckpt_path = os.path.join(out_dir, f"model_epoch_{epoch:03d}.pth")
@@ -455,6 +459,9 @@ def train(
             best_path = os.path.join(out_dir, "model_best.pth")
             torch.save(model.state_dict(), best_path)
             print(f"New best val={best_val:.4f} -> Saved:", best_path)
+
+    writer.close()    
+
 
 
 if __name__ == "__main__":
