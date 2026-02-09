@@ -39,6 +39,7 @@ Run:
 
 import os, glob, random, re
 import numpy as np
+import json
 
 import torch
 import torch.nn.functional as F
@@ -247,16 +248,16 @@ def train(
     files = make_pairs(os.path.join(data_root, "imagesTr"), os.path.join(data_root, "labelsTr"))
     random.shuffle(files)
 
-    train_files = files
-    val_files = files
+    # train_files = files
+    # val_files = files
 
-    # if len(files) < 2:
-    #     train_files = files
-    #     val_files = files
-    # else:
-    #     n_val = max(1, int(0.2 * len(files)))
-    #     val_files = files[:n_val]
-    #     train_files = files[n_val:] if len(files[n_val:]) > 0 else files
+    if len(files) < 2:
+        train_files = files
+        val_files = files
+    else:
+        n_val = max(1, int(0.2 * len(files)))
+        val_files = files[:n_val]
+        train_files = files[n_val:] if len(files[n_val:]) > 0 else files
 
     print(f"Found total: {len(files)} | train: {len(train_files)} | val: {len(val_files)}")
     print(f"KMAX={kmax} -> in_channels={1+kmax}, out_channels={1+kmax}")
@@ -270,6 +271,7 @@ def train(
 
         CropForegroundd(keys=["image", "label"], source_key="label"),
         SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
+        # What is this for ? TODO READ
         CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size),
 
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
@@ -309,6 +311,15 @@ def train(
 
     best_val = -1.0
 
+    #logging
+
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "val_fg_union_dice": [],
+    }
+    history_path = os.path.join(out_dir, "history.json")
+
     for epoch in range(1, epochs + 1):
         # ---------- TRAIN ----------
         model.train()
@@ -329,8 +340,8 @@ def train(
                     gt_parts[b],
                     kmax=kmax,
                     k_range=(2, 5),
-                    clicks_per_label=(1, 3),
-                    click_radius=(1, 3),
+                    clicks_per_label=(5, 10),
+                    click_radius=(3, 8),
                     p_empty=0.05,
                 )
                 prompt_oh_list.append(prompt_oh)      # (kmax,D,H,W)
@@ -393,8 +404,8 @@ def train(
                             gt_parts[b],
                             kmax=kmax,
                             k_range=(2, 5),
-                            clicks_per_label=(1, 3),
-                            click_radius=(1, 3),
+                            clicks_per_label=(5, 10),
+                            click_radius=(3, 8),
                             p_empty=0.05,
                         )
                         prompt_oh_list.append(prompt_oh)
@@ -422,6 +433,16 @@ def train(
         if mean_dice_fg is not None:
             msg += f" | val_fg_union_dice={mean_dice_fg:.4f}"
         print(msg)
+
+        #Logging
+
+        history["epoch"].append(int(epoch))
+        history["train_loss"].append(float(epoch_loss))
+        history["val_fg_union_dice"].append(None if mean_dice_fg is None else float(mean_dice_fg))
+
+        # saving the epoch so that it can be inpspected during training
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
 
         # ---------- SAVE ----------
         if (epoch % save_every) == 0 or epoch == epochs:
@@ -452,3 +473,7 @@ if __name__ == "__main__":
         val_every=1,
         prompt_ce_w=0.5,  # tune 0.2..1.0
     )
+    #Plotten loss and validation loss tracken
+    #Logging wiht tensorboard oder weight and slices 
+    #What is the exactly archtecture of the 3DUnet von nnInterractive
+

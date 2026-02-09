@@ -2,5 +2,5 @@
 trainer/runs_clickprompts/
 
 # Training data (CADs + nnU-Net output)
-traingsdaten/cads/
-traingsdaten/nnUnet_raw/
+trainingsdata/cads/
+trainingsdata/nnUNet_raw/
