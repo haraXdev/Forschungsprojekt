@@ -219,6 +219,49 @@ def prompt_click_consistency_ce(
     sel_target = prompt_int[m]                      # (N,)
     return F.cross_entropy(sel_logits, sel_target, reduction="mean")
 
+def log_fixed_prompt_from_gt_tb(writer, model, epoch, fixed_ct, fixed_prompt_int, fixed_target_int, fixed_x):
+    model.eval()
+    with torch.no_grad():
+        logits = model(fixed_x)
+        pred = torch.argmax(logits, dim=1)  # (1,D,H,W)
+
+        ct  = fixed_ct[0, 0]         # (D,H,W)
+        prm = fixed_prompt_int[0]    # (D,H,W)
+        tgt = fixed_target_int[0]    # (D,H,W)
+        prd = pred[0]                # (D,H,W)
+
+        D = ct.shape[0]
+        z_slices = [D//2, max(0, D//2 - D//8), min(D-1, D//2 + D//8)]
+        for i, z in enumerate(z_slices):
+            writer.add_image(
+                f"fixed/pred_color_z{i}",
+                colorize_labels(prd[z]),
+                epoch
+            )
+
+            writer.add_image(
+                f"fixed/gt_color_z{i}",
+                colorize_labels(tgt[z]),
+                epoch
+            )
+    model.train()
+
+def colorize_labels(lbl):
+# lbl: (H,W) int
+    colors = torch.tensor([
+        [0, 0, 0],      # background
+        [255, 0, 0],    # class 1
+        [0, 255, 0],    # class 2
+        [0, 0, 255],    # class 3
+        [255, 255, 0],  # class 4
+        [255, 0, 255],  # class 5
+        [0, 255, 255],  # class 6
+        [255, 255, 255],
+    ], device=lbl.device)
+
+    lbl = torch.clamp(lbl, 0, colors.shape[0] - 1)
+    return colors[lbl].permute(2, 0, 1) / 255.0
+
 
 # -------------------------
 # 2) training loop
@@ -290,6 +333,58 @@ def train(
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=list_data_collate)
     val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=list_data_collate)
+
+    tf_log = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    ScaleIntensityd(keys=["image"]),
+    EnsureTyped(keys=["image", "label"]),
+    CropForegroundd(keys=["image", "label"], source_key="label"),
+    SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
+    CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size),
+    ])
+
+    # Get a fixed val batch for deterministic prompt/target generation and tracking metrics on it
+
+    fixed_entry = {
+    "image": r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic/imagesTr/case_0001_0000.nii.gz",
+    "label": r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic/labelsTr/case_0001.nii.gz",
+    }
+
+    fixed_item = tf_log(fixed_entry)
+
+    fixed_ct = fixed_item["image"].unsqueeze(0).to(device)       # (1,1,D,H,W)
+    fixed_gt_parts = fixed_item["label"].unsqueeze(0).to(device) 
+
+    np_state = np.random.get_state()
+    py_state = random.getstate()
+    torch_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    np.random.seed(123)
+    random.seed(123)
+    torch.manual_seed(123)
+
+    fixed_prompt_oh, fixed_target_int, fixed_prompt_int = simulate_prompt_and_target_from_parts(
+        fixed_gt_parts[0],
+        kmax=kmax,
+        k_range=(2, 5),
+        clicks_per_label=(5, 10),
+        click_radius=(3, 8),
+        p_empty=0.0,
+    )
+
+    # restore RNG so training stays the same
+    np.random.set_state(np_state)
+    random.setstate(py_state)
+    torch.random.set_rng_state(torch_state)
+
+    fixed_prompt_oh   = fixed_prompt_oh.unsqueeze(0).to(device)     # (1,kmax,D,H,W)
+    fixed_target_int  = fixed_target_int.unsqueeze(0).to(device)    # (1,D,H,W)
+    fixed_prompt_int  = fixed_prompt_int.unsqueeze(0).to(device)    # (1,D,H,W)
+
+    fixed_x = torch.cat([fixed_ct, fixed_prompt_oh], dim=1)
 
     # UNet: multi-class
     model = UNet(
@@ -459,6 +554,10 @@ def train(
             best_path = os.path.join(out_dir, "model_best.pth")
             torch.save(model.state_dict(), best_path)
             print(f"New best val={best_val:.4f} -> Saved:", best_path)
+    
+        #Logging Call
+
+        log_fixed_prompt_from_gt_tb(writer, model, epoch, fixed_ct, fixed_prompt_int, fixed_target_int, fixed_x)
 
     writer.close()    
 
