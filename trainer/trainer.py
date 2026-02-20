@@ -310,10 +310,13 @@ def train(
     print(f"Found total: {len(files)} | train: {len(train_files)} | val: {len(val_files)}")
     print(f"KMAX={kmax} -> in_channels={1+kmax}, out_channels={1+kmax}")
 
+    #TODO anschauen was das macht
     tf = Compose([
         LoadImaged(keys=["image", "label"]),
+        #TODO
         EnsureChannelFirstd(keys=["image", "label"]),
         Orientationd(keys=["image", "label"], axcodes="RAS"),
+        #TODO
         ScaleIntensityd(keys=["image"]),
         EnsureTyped(keys=["image", "label"]),
 

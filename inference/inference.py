@@ -12,11 +12,11 @@ from monai.networks.nets import UNet
 # CONFIG – EDIT THESE TWO PATHS
 # ============================================================
 MODEL_CHECKPOINT_PATH = Path(
-    r"C:/uniDev/fProject/trainer/runs_clickprompts/model_best.pth"
+    r"C:/uniDev/fProject/inference/model/model_epoch_075.pth"
 )
 
 INPUT_IMAGE_PATH = Path(
-    r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic/imagesTr/case_0003_0000.nii.gz"
+    r"C:/uniDev/fProject/inference/image/case_0159_0000.nii"
 )
 
 KMAX = 8
