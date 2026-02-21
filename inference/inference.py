@@ -1,31 +1,56 @@
+import os
+from pathlib import Path
+
+# ============================================================
+# HARD STARTUP DEBUG (to prove which file is running + where)
+# ============================================================
+print("=== START inference.py (UPDATED DEBUG) ===", flush=True)
+print("SCRIPT PATH:", Path(__file__).resolve(), flush=True)
+print("CWD:", Path.cwd().resolve(), flush=True)
+
+# Force debug log to live NEXT TO THIS SCRIPT (absolute path)
+DEBUG_LOG_PATH = Path(__file__).resolve().parent / "debug_log.txt"
+DEBUG_LOG_PATH.write_text("=== debug log created at startup ===\n", encoding="utf-8")
+print("DEBUG_LOG_PATH:", DEBUG_LOG_PATH, flush=True)
+# ============================================================
+
 import numpy as np
 import torch
 import napari
-from pathlib import Path
 from magicgui import magicgui
 import nibabel as nib
 
 from monai.networks.nets import UNet
+from monai.inferers import sliding_window_inference
+
+from napari.utils.notifications import show_info
 
 
 # ============================================================
-# CONFIG – EDIT THESE TWO PATHS
+# CONFIG
 # ============================================================
-MODEL_CHECKPOINT_PATH = Path(
-    r"C:/uniDev/fProject/inference/model/model_epoch_075.pth"
-)
-
-INPUT_IMAGE_PATH = Path(
-    r"C:/uniDev/fProject/inference/image/case_0159_0000.nii"
-)
+MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_epoch_075.pth")
+INPUT_IMAGE_PATH      = Path(r"C:/uniDev/fProject/inference/image/case_0159_0000.nii")
 
 KMAX = 8
+PATCH_SIZE = (64, 64, 64)      # must match training patch_size
+SW_BATCH_SIZE = 2              # adjust for your VRAM
+OVERLAP = 0.25                 # typical
 FORCE_CPU = False
+
+# Prompt-ROI settings (recommended for your training distribution)
+PROMPT_MARGIN = 24             # voxels around prompts
 # ============================================================
+
+
+def log(msg: str):
+    print(msg, flush=True)
+    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
 
 
 def build_model(kmax: int = 8):
-    model = UNet(
+    return UNet(
         spatial_dims=3,
         in_channels=1 + kmax,
         out_channels=1 + kmax,
@@ -34,24 +59,18 @@ def build_model(kmax: int = 8):
         num_res_units=2,
     )
 
-    # 🔑 IMPORTANT: unwrap MONAI internal "model" container
-    if hasattr(model, "model"):
-        model = model.model
-
-    return model
-
 
 def load_state_dict_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: torch.device):
     state = torch.load(str(ckpt_path), map_location=device)
 
-    # allow nested dict formats too (just in case)
+    # allow nested formats
     if isinstance(state, dict):
         for key in ["state_dict", "model_state_dict", "model", "net", "network"]:
             if key in state and isinstance(state[key], dict):
                 state = state[key]
                 break
 
-    # strip common prefixes
+    # strip common outer prefixes if present
     cleaned = {}
     for k, v in state.items():
         for prefix in ["model.", "net.", "network."]:
@@ -59,155 +78,247 @@ def load_state_dict_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: 
                 k = k[len(prefix):]
         cleaned[k] = v
 
-    missing, unexpected = model.load_state_dict(cleaned, strict=True)
+    # ---- AUTO-FIX PREFIX MISMATCH ----
+    model_keys = list(model.state_dict().keys())
+    if not model_keys:
+        raise RuntimeError("Model has no state_dict keys?")
+
+    expects_model_prefix = model_keys[0].startswith("model.")
+    ckpt_has_model_prefix = next(iter(cleaned.keys())).startswith("model.")
+
+    if expects_model_prefix and not ckpt_has_model_prefix:
+        cleaned = {f"model.{k}": v for k, v in cleaned.items()}
+
+    if (not expects_model_prefix) and ckpt_has_model_prefix:
+        cleaned = {k[len("model."):]: v for k, v in cleaned.items()}
+
+    missing, unexpected = model.load_state_dict(cleaned, strict=False)
     if missing:
-        print("[WARN] Missing keys (showing up to 10):", missing[:10])
+        log(f"[WARN] Missing keys (up to 10): {missing[:10]}")
     if unexpected:
-        print("[WARN] Unexpected keys (showing up to 10):", unexpected[:10])
+        log(f"[WARN] Unexpected keys (up to 10): {unexpected[:10]}")
 
     model.to(device).eval()
     return model
 
 
-def load_nifti_volume(path: Path) -> np.ndarray:
-    nii = nib.load(str(path))
-    vol = nii.get_fdata().astype(np.float32)  # usually (X,Y,Z) or (Z,Y,X) depending on file
-    # We won't reorient here—training did Orientationd("RAS") in MONAI,
-    # but for inference visualization this is OK as long as you're consistent.
-    return vol
+def load_nifti_as_ras_zyx(path: Path) -> np.ndarray:
+    img = nib.load(str(path))
+    img = nib.as_closest_canonical(img)
+    vol_xyz = img.get_fdata().astype(np.float32)   # (X,Y,Z)
+    vol_zyx = np.transpose(vol_xyz, (2, 1, 0))     # (Z,Y,X)
+    return vol_zyx
 
 
-def normalize_like_training(vol: np.ndarray) -> np.ndarray:
-    """
-    Training used MONAI ScaleIntensityd on 'image'.
-    For inference we apply a reasonable equivalent:
-      - robust min/max (1..99 percentile)
-      - scale to [0,1]
-    """
-    vmin, vmax = np.percentile(vol, (1, 99))
-    vol = (vol - vmin) / (vmax - vmin + 1e-8)
-    return np.clip(vol, 0.0, 1.0).astype(np.float32)
+def scale_intensity_minmax_like_monai(vol: np.ndarray) -> np.ndarray:
+    vmin = float(np.min(vol))
+    vmax = float(np.max(vol))
+    if vmax <= vmin + 1e-8:
+        return np.zeros_like(vol, dtype=np.float32)
+    out = (vol - vmin) / (vmax - vmin)
+    return out.astype(np.float32)
 
 
-def prompt_int_to_onehot(prompt_int: np.ndarray, kmax: int) -> np.ndarray:
-    """
-    prompt_int: (D,H,W) int in [0..kmax]
-    returns: (kmax, D,H,W) float32 onehot for labels 1..kmax
-    """
-    oh = np.zeros((kmax,) + prompt_int.shape, dtype=np.float32)
+def prompt_int_to_onehot(prompt_int_zyx: np.ndarray, kmax: int) -> np.ndarray:
+    oh = np.zeros((kmax,) + prompt_int_zyx.shape, dtype=np.float32)
     for c in range(1, kmax + 1):
-        oh[c - 1] = (prompt_int == c).astype(np.float32)
+        oh[c - 1] = (prompt_int_zyx == c).astype(np.float32)
     return oh
 
 
-@torch.inference_mode()
-def run_model(model: torch.nn.Module, ct_vol: np.ndarray, prompt_int: np.ndarray, device: torch.device, kmax: int):
-    """
-    ct_vol:     (D,H,W) float32 in [0,1]
-    prompt_int: (D,H,W) int in [0..kmax]
-    returns:
-      pred_lbl: (D,H,W) int in [0..kmax]
-      fg_prob:  (D,H,W) float32 = 1 - p(background)
-    """
-    prompt_oh = prompt_int_to_onehot(prompt_int, kmax)  # (kmax,D,H,W)
+def bbox_from_mask(mask_zyx: np.ndarray, margin: int):
+    zs, ys, xs = np.where(mask_zyx > 0)
+    if zs.size == 0:
+        return None
+    z0, z1 = int(zs.min()), int(zs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
 
-    # to torch: (1, C, D, H, W)
-    x = np.concatenate([ct_vol[None, ...], prompt_oh], axis=0).astype(np.float32)  # (1+kmax,D,H,W)
+    z0 = max(0, z0 - margin)
+    y0 = max(0, y0 - margin)
+    x0 = max(0, x0 - margin)
+    z1 = min(mask_zyx.shape[0], z1 + margin)
+    y1 = min(mask_zyx.shape[1], y1 + margin)
+    x1 = min(mask_zyx.shape[2], x1 + margin)
+
+    return (z0, z1, y0, y1, x0, x1)
+
+
+def pad_to_min_size(vol_zyx: np.ndarray, min_size=(64, 64, 64), constant=0):
+    z, y, x = vol_zyx.shape
+    pz = max(0, min_size[0] - z)
+    py = max(0, min_size[1] - y)
+    px = max(0, min_size[2] - x)
+
+    pad = (
+        (pz // 2, pz - pz // 2),
+        (py // 2, py - py // 2),
+        (px // 2, px - px // 2),
+    )
+    vol_p = np.pad(vol_zyx, pad, mode="constant", constant_values=constant)
+    return vol_p, pad
+
+
+def unpad(vol_zyx: np.ndarray, pad):
+    (z0, z1), (y0, y1), (x0, x1) = pad
+    z_slice = slice(z0, vol_zyx.shape[0] - z1 if z1 > 0 else vol_zyx.shape[0])
+    y_slice = slice(y0, vol_zyx.shape[1] - y1 if y1 > 0 else vol_zyx.shape[1])
+    x_slice = slice(x0, vol_zyx.shape[2] - x1 if x1 > 0 else vol_zyx.shape[2])
+    return vol_zyx[z_slice, y_slice, x_slice]
+
+
+@torch.inference_mode()
+def run_model_sliding_window(
+    model: torch.nn.Module,
+    ct_zyx: np.ndarray,
+    prompt_int_zyx: np.ndarray,
+    device: torch.device,
+    kmax: int,
+):
+    prompt_oh = prompt_int_to_onehot(prompt_int_zyx, kmax)
+    x = np.concatenate([ct_zyx[None, ...], prompt_oh], axis=0).astype(np.float32)
     x_t = torch.from_numpy(x)[None, ...].to(device)
 
-    logits = model(x_t)  # (1, 1+kmax, D, H, W)
-    probs = torch.softmax(logits, dim=1)[0]  # (1+kmax, D,H,W)
+    logits = sliding_window_inference(
+        inputs=x_t,
+        roi_size=PATCH_SIZE,
+        sw_batch_size=SW_BATCH_SIZE,
+        predictor=model,
+        overlap=OVERLAP,
+        mode="gaussian",
+        padding_mode="constant",
+        cval=0.0,
+    )
 
-    pred = torch.argmax(probs, dim=0).detach().cpu().numpy().astype(np.int32)  # (D,H,W)
+    probs = torch.softmax(logits, dim=1)[0]
+    pred = torch.argmax(probs, dim=0).detach().cpu().numpy().astype(np.int32)
 
     p_bg = probs[0].detach().cpu().numpy().astype(np.float32)
     fg_prob = (1.0 - p_bg).astype(np.float32)
-
     return pred, fg_prob
+
+
+@torch.inference_mode()
+def run_prompt_roi_inference(
+    model: torch.nn.Module,
+    ct_zyx: np.ndarray,
+    prompt_int_zyx: np.ndarray,
+    device: torch.device,
+    kmax: int,
+    margin: int = 24,
+):
+    bb = bbox_from_mask(prompt_int_zyx, margin=margin)
+    if bb is None:
+        pred_full = np.zeros_like(prompt_int_zyx, dtype=np.int32)
+        fg_full = np.zeros_like(ct_zyx, dtype=np.float32)
+        return pred_full, fg_full
+
+    z0, z1, y0, y1, x0, x1 = bb
+    ct_roi = ct_zyx[z0:z1, y0:y1, x0:x1]
+    pr_roi = prompt_int_zyx[z0:z1, y0:y1, x0:x1]
+
+    ct_roi_p, pad_ct = pad_to_min_size(ct_roi, PATCH_SIZE, constant=0.0)
+    pr_roi_p, _ = pad_to_min_size(pr_roi, PATCH_SIZE, constant=0)
+
+    pred_roi_p, fg_roi_p = run_model_sliding_window(model, ct_roi_p, pr_roi_p, device, kmax)
+
+    pred_roi = unpad(pred_roi_p, pad_ct)
+    fg_roi = unpad(fg_roi_p, pad_ct)
+
+    pred_full = np.zeros_like(prompt_int_zyx, dtype=np.int32)
+    fg_full = np.zeros_like(ct_zyx, dtype=np.float32)
+
+    pred_full[z0:z1, y0:y1, x0:x1] = pred_roi
+    fg_full[z0:z1, y0:y1, x0:x1] = fg_roi
+    return pred_full, fg_full
 
 
 def main():
     device = torch.device("cpu" if FORCE_CPU or not torch.cuda.is_available() else "cuda")
-    print("Using device:", device)
+    log(f"Using device: {device}")
 
     if not MODEL_CHECKPOINT_PATH.exists():
         raise FileNotFoundError(MODEL_CHECKPOINT_PATH)
     if not INPUT_IMAGE_PATH.exists():
         raise FileNotFoundError(INPUT_IMAGE_PATH)
 
-    # Load data
-    ct = load_nifti_volume(INPUT_IMAGE_PATH)
-    ct = normalize_like_training(ct)
+    ct_zyx = load_nifti_as_ras_zyx(INPUT_IMAGE_PATH)
+    ct_zyx = scale_intensity_minmax_like_monai(ct_zyx)
+    prompt_zyx = np.zeros_like(ct_zyx, dtype=np.int32)
 
-    # Ensure it's (D,H,W) for the network input.
-    # Many NIfTIs load as (H,W,D) or (X,Y,Z). We will convert to (D,H,W) by moving last axis to first.
-    # If your data already is (D,H,W), this still works if D is the last axis.
-    if ct.shape[0] != ct.shape[-1]:
-        ct_dhw = np.moveaxis(ct, -1, 0)
-    else:
-        ct_dhw = ct
-
-    # Init empty prompts
-    prompt = np.zeros_like(ct_dhw, dtype=np.int32)
-
-    # Model
     model = build_model(KMAX)
     model = load_state_dict_checkpoint(model, MODEL_CHECKPOINT_PATH, device)
 
-    # Napari UI
-    viewer = napari.Viewer(title="Interactive Click-Prompt UNet (MONAI)")
+    viewer = napari.Viewer(title="Interactive Click-Prompt UNet (Prompt-ROI Inference)")
+    viewer.add_image(ct_zyx, name="ct (RAS canonical, ZYX)", contrast_limits=(0, 1))
 
-    viewer.add_image(ct_dhw, name="ct", contrast_limits=(0, 1))
-
-    # Prompt layer: paint integers 0..KMAX
-    prompt_layer = viewer.add_labels(
-    prompt,
-    name="prompt",
-)
+    prompt_layer = viewer.add_labels(prompt_zyx, name="prompt")
 
     pred_layer = viewer.add_labels(
-        np.zeros_like(prompt, dtype=np.int32),
+        np.zeros_like(prompt_zyx, dtype=np.int32),
         name="pred",
         opacity=0.6,
     )
 
-    # Foreground probability
     prob_layer = viewer.add_image(
-        np.zeros_like(ct_dhw, dtype=np.float32),
+        np.zeros_like(ct_zyx, dtype=np.float32),
         name="fg_prob",
         opacity=0.5,
         visible=False,
     )
 
-    # Helpful defaults
     viewer.layers.selection.active = prompt_layer
-    prompt_layer.brush_size = 2  # adjust to your liking
-    prompt_layer.selected_label = 1  # start painting label 1
+    prompt_layer.brush_size = 2
+    prompt_layer.selected_label = 1
 
     @magicgui(
-        call_button="Run inference",
+        call_button="Run inference (prompt ROI)",
         show_prob={"label": "Show fg_prob layer"},
         clear_prompt={"label": "Clear prompt"},
         selected_label={"label": "Selected prompt label", "min": 0, "max": KMAX},
+        margin={"label": "ROI margin (vox)", "min": 0, "max": 256},
     )
     def controls(
         selected_label: int = 1,
         show_prob: bool = False,
         clear_prompt: bool = False,
+        margin: int = PROMPT_MARGIN,
     ):
-        # allow changing selected label from widget
+        show_info("Inference button clicked")
+        log(">>> BUTTON CLICKED <<<")
+
         prompt_layer.selected_label = int(selected_label)
 
         if clear_prompt:
+            show_info("Prompt cleared")
             prompt_layer.data[:] = 0
             pred_layer.data[:] = 0
             prob_layer.data[:] = 0
             prompt_layer.refresh()
             pred_layer.refresh()
             prob_layer.refresh()
+            log(">>> PROMPT CLEARED <<<")
             return
 
-        pred, fg_prob = run_model(model, ct_dhw, prompt_layer.data.astype(np.int32), device, KMAX)
+        pr = prompt_layer.data.astype(np.int32)
+
+        # --- DEBUG ---
+        u, c = np.unique(pr, return_counts=True)
+        log(f"PROMPT unique: {list(zip(u.tolist(), c.tolist()))}")
+        oh = prompt_int_to_onehot(pr, KMAX)
+        log(f"prompt sum per channel: {[float(oh[i].sum()) for i in range(KMAX)]}")
+        # -----------
+
+        pred, fg_prob = run_prompt_roi_inference(
+            model=model,
+            ct_zyx=ct_zyx,
+            prompt_int_zyx=pr,
+            device=device,
+            kmax=KMAX,
+            margin=int(margin),
+        )
+
+        log(f"PRED unique: {np.unique(pred).tolist()}")
 
         pred_layer.data = pred
         pred_layer.refresh()
@@ -216,7 +327,9 @@ def main():
         prob_layer.visible = bool(show_prob)
         prob_layer.refresh()
 
-    viewer.window.add_dock_widget(controls, area="right")
+        show_info("Inference done. Open debug_log.txt next to inference.py")
+
+    viewer.window.add_dock_widget(controls, area="right", name="Inference Controls")
     napari.run()
 
 
