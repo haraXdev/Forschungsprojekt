@@ -24,13 +24,14 @@ from monai.networks.nets import UNet
 from monai.inferers import sliding_window_inference
 
 from napari.utils.notifications import show_info
+from scipy import ndimage as ndi  # <-- FIX 1 needs this
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_epoch_075.pth")
-INPUT_IMAGE_PATH      = Path(r"C:/uniDev/fProject/inference/image/case_0159_0000.nii")
+INPUT_IMAGE_PATH      = Path(r"C:/uniDev/fProject/inference/image/case_0005_0000.nii")
 
 KMAX = 8
 PATCH_SIZE = (64, 64, 64)      # must match training patch_size
@@ -40,6 +41,7 @@ FORCE_CPU = False
 
 # Prompt-ROI settings (recommended for your training distribution)
 PROMPT_MARGIN = 24             # voxels around prompts
+DEFAULT_DILATE_RADIUS = 5      # <-- start with 5, try 4..8
 # ============================================================
 
 
@@ -126,6 +128,37 @@ def prompt_int_to_onehot(prompt_int_zyx: np.ndarray, kmax: int) -> np.ndarray:
     return oh
 
 
+# ============================================================
+# FIX 1: Make inference prompts look like training prompts
+# (training used balls radius ~3..8 and multiple clicks)
+# ============================================================
+def _spherical_se(radius: int) -> np.ndarray:
+    zz, yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1, -radius:radius+1]
+    return (zz * zz + yy * yy + xx * xx) <= radius * radius
+
+
+def dilate_prompts_per_label(prompt_int_zyx: np.ndarray, kmax: int, radius: int = 5) -> np.ndarray:
+    """
+    Dilate each label separately with a spherical-ish structuring element.
+    This approximates your training clicks (balls) and improves propagation.
+    """
+    if radius <= 0:
+        return prompt_int_zyx
+
+    se = _spherical_se(int(radius))
+    out = np.zeros_like(prompt_int_zyx, dtype=np.int32)
+
+    for lbl in range(1, kmax + 1):
+        m = (prompt_int_zyx == lbl)
+        if not m.any():
+            continue
+        m_d = ndi.binary_dilation(m, structure=se)
+        out[m_d] = lbl
+
+    return out
+# ============================================================
+
+
 def bbox_from_mask(mask_zyx: np.ndarray, margin: int):
     zs, ys, xs = np.where(mask_zyx > 0)
     if zs.size == 0:
@@ -188,12 +221,30 @@ def run_model_sliding_window(
         mode="gaussian",
         padding_mode="constant",
         cval=0.0,
-    )
+    )  # (1, C, Z, Y, X) where C = 1+kmax
 
-    probs = torch.softmax(logits, dim=1)[0]
-    pred = torch.argmax(probs, dim=0).detach().cpu().numpy().astype(np.int32)
+    probs = torch.softmax(logits, dim=1)[0]  # (C, Z, Y, X)
 
-    p_bg = probs[0].detach().cpu().numpy().astype(np.float32)
+    # ------------------------------------------------------------
+    # Restrict predictions to {background + prompted labels}
+    # ------------------------------------------------------------
+    present = np.unique(prompt_int_zyx)
+    present = present[present > 0]  # only prompted label IDs
+    allowed = np.concatenate([[0], present]).astype(np.int64)
+
+    probs_np = probs.detach().cpu().numpy().astype(np.float32)  # (C,Z,Y,X)
+    keep = np.zeros((kmax + 1,), dtype=bool)
+    keep[allowed] = True
+    probs_np[~keep, ...] = 0.0
+
+    pred = np.argmax(probs_np, axis=0).astype(np.int32)  # (Z,Y,X)
+
+    # enforce prompt voxels exactly (recommended)
+    m = prompt_int_zyx > 0
+    pred[m] = prompt_int_zyx[m]
+    # ------------------------------------------------------------
+
+    p_bg = probs_np[0]  # (Z,Y,X)
     fg_prob = (1.0 - p_bg).astype(np.float32)
     return pred, fg_prob
 
@@ -277,12 +328,14 @@ def main():
         clear_prompt={"label": "Clear prompt"},
         selected_label={"label": "Selected prompt label", "min": 0, "max": KMAX},
         margin={"label": "ROI margin (vox)", "min": 0, "max": 256},
+        dilate_radius={"label": "Dilate prompt radius (vox)", "min": 0, "max": 12},
     )
     def controls(
         selected_label: int = 1,
         show_prob: bool = False,
         clear_prompt: bool = False,
         margin: int = PROMPT_MARGIN,
+        dilate_radius: int = DEFAULT_DILATE_RADIUS,
     ):
         show_info("Inference button clicked")
         log(">>> BUTTON CLICKED <<<")
@@ -302,17 +355,21 @@ def main():
 
         pr = prompt_layer.data.astype(np.int32)
 
+        # ===== FIX 1 applied here =====
+        pr_dil = dilate_prompts_per_label(pr, KMAX, radius=int(dilate_radius))
+        # =============================
+
         # --- DEBUG ---
-        u, c = np.unique(pr, return_counts=True)
-        log(f"PROMPT unique: {list(zip(u.tolist(), c.tolist()))}")
-        oh = prompt_int_to_onehot(pr, KMAX)
-        log(f"prompt sum per channel: {[float(oh[i].sum()) for i in range(KMAX)]}")
+        u, c = np.unique(pr_dil, return_counts=True)
+        log(f"PROMPT(unique, after dilation): {list(zip(u.tolist(), c.tolist()))}")
+        oh = prompt_int_to_onehot(pr_dil, KMAX)
+        log(f"prompt sum per channel (after dilation): {[float(oh[i].sum()) for i in range(KMAX)]}")
         # -----------
 
         pred, fg_prob = run_prompt_roi_inference(
             model=model,
             ct_zyx=ct_zyx,
-            prompt_int_zyx=pr,
+            prompt_int_zyx=pr_dil,
             device=device,
             kmax=KMAX,
             margin=int(margin),
