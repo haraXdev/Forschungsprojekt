@@ -1,37 +1,33 @@
 """
 trainer_interactive_labeled_clicks_unet.py
 
-Interactive trainer (as discussed):
+Interactive trainer:
 
 Input:
   - CT volume (1 channel)
-  - Prompt mask where the user "clicks" voxels and assigns LABEL IDs (1..K)
+  - Prompt mask where user "clicks" voxels and assigns LABEL IDs (1..K)
     * Labels have NO global meaning across volumes.
     * They are just IDs for "the region I clicked as label i" in THIS volume.
 
-How we make this trainable:
-  - We fix a maximum number of interactive labels: KMAX (default 8).
-  - We convert the integer prompt mask into KMAX one-hot channels.
-  - So model input channels = 1 + KMAX.
+Trainable formulation:
+  - Fix maximum number of interactive labels: KMAX (default 8).
+  - Convert integer prompt mask into KMAX one-hot channels.
+  - Model input channels = 1 + KMAX.
 
 Output:
   - Multi-class segmentation with (KMAX + 1) channels:
       0 = background
       1..KMAX = prompted regions
-  - Note: during each training step we only prompt a subset of GT parts and remap them
-    to labels 1..k (k <= KMAX). All other parts become background for that step.
-    This forces the model to learn "seeded region growing" from CT + prompts.
 
 Loss:
-  - DiceCE (multi-class) over the dense target
-  - Prompt consistency CE loss on ONLY the prompted voxels (so clicks strongly affect output)
+  - DiceCE (multi-class) over dense target
+  - Prompt consistency CE loss on ONLY prompted voxels
 
-Data layout (nnU-Net raw):
-  <data_root>/
-    imagesTr/
-      case_0000_0000.nii.gz
-    labelsTr/
-      case_0000.nii.gz   (0=background, 1..N parts within this sample)
+LR schedule:
+  - ReduceLROnPlateau monitored on validation foreground-union Dice (maximize).
+
+TensorBoard:
+  - logs train loss, val loss, val dice, and learning rate (lr).
 
 Run:
   python trainer_interactive_labeled_clicks_unet.py
@@ -53,8 +49,6 @@ from monai.transforms import (
 from monai.data import CacheDataset, list_data_collate
 from monai.networks.nets import UNet
 from monai.losses import DiceCELoss
-
-from scipy import ndimage as ndi
 
 
 # -------------------------
@@ -78,11 +72,7 @@ def make_pairs(images_dir, labels_dir):
 
         # remove ONLY the final "_0000" (or "_0001", etc.) before the extension
         label_base = re.sub(r'_\d{4}(?=\.nii(\.gz)?$)', '', base)
-
         lbl = os.path.join(labels_dir, label_base)
-
-        # if not os.path.exists(lbl):
-        #     raise FileNotFoundError(f"Label missing for {img}: expected {lbl}")
 
         data.append({"image": img, "label": lbl})
     return data
@@ -119,25 +109,16 @@ def simulate_prompt_and_target_from_parts(
       prompt_onehot: (kmax, D, H, W) float {0,1}
       target_int:   (D, H, W) long in [0..kmax] (dense training target)
       prompt_int:   (D, H, W) long in [0..kmax] (sparse prompt IDs at clicked voxels)
-    Semantics:
-      - We pick a random subset of GT parts and remap them to labels 1..k (k<=kmax).
-      - Only those chosen parts are "foreground classes" for this iteration.
-      - All other parts become background (0) for this iteration.
     """
     lbl = parts_label_1dhw[0].detach().cpu().numpy().astype(np.int32)  # (D,H,W)
 
-    # optionally no prompts: train automatic mode too
+    # optionally no prompts: train fallback "foreground union" in class 1
     if np.random.rand() < p_empty:
         D, H, W = lbl.shape
         prompt_onehot = np.zeros((kmax, D, H, W), dtype=np.float32)
         prompt_int = np.zeros((D, H, W), dtype=np.int64)
-        # In "no prompt" mode, we train object-vs-background union as class 1 (optional).
-        # But that would introduce semantics. So instead we train "background only" which is useless.
-        # Better: still do prompted training mostly. We'll simply return empty prompts and use
-        # a remapped target with k=1 on union object so it learns an auto fallback without semantics:
         target_int = np.zeros((D, H, W), dtype=np.int64)
         target_int[lbl > 0] = 1
-        # set channel for label 1 empty (no clicks), still ok
         return (
             torch.from_numpy(prompt_onehot),
             torch.from_numpy(target_int),
@@ -183,7 +164,6 @@ def simulate_prompt_and_target_from_parts(
             r = np.random.randint(click_radius[0], click_radius[1] + 1)
             tmp = np.zeros((D, H, W), dtype=np.uint8)
             _draw_ball_u8(tmp, (int(cz), int(cy), int(cx)), int(r))
-            # write label id where the ball is
             prompt_int[tmp > 0] = new_id
 
     # one-hot encode prompt into kmax channels
@@ -208,14 +188,11 @@ def prompt_click_consistency_ce(
     logits:     (B, C, D, H, W) where C = kmax+1
     prompt_int: (B, D, H, W) long in [0..kmax], sparse (>0 only at clicks)
     """
-    # only where prompt_int > 0
     m = prompt_int > 0  # (B,D,H,W)
     if not m.any():
         return logits.new_tensor(0.0)
 
-    # flatten selected voxels
-    # logits: (B,C,D,H,W) -> (N,C)
-    sel_logits = logits.permute(0, 2, 3, 4, 1)[m]   # (N,C)
+    sel_logits = logits.permute(0, 2, 3, 4, 1)[m]  # (N,C)
     sel_target = prompt_int[m]                      # (N,)
     return F.cross_entropy(sel_logits, sel_target, reduction="mean")
 
@@ -235,16 +212,24 @@ def train(
     cache_rate: float = 0.2,
     seed: int = 0,
     save_every: int = 25,
-    val_every: int = 1,
+    val_every: int = 10,
     prompt_ce_w: float = 0.5,
+    # ---- ReduceLROnPlateau ----
+    lr_factor: float = 0.5,
+    lr_patience: int = 3,      # counts *validation calls*, not epochs
+    lr_min: float = 1e-6,
+    lr_threshold: float = 1e-4,
 ):
     set_seed(seed)
     os.makedirs(out_dir, exist_ok=True)
 
     tb_dir = os.path.join(out_dir, "tb")
     writer = SummaryWriter(log_dir=tb_dir)
-
-    writer.add_text("hparams", f"kmax={kmax}, patch_size={patch_size}, lr={lr}, prompt_ce_w={prompt_ce_w}")
+    writer.add_text(
+        "hparams",
+        f"kmax={kmax}, patch_size={patch_size}, init_lr={lr}, prompt_ce_w={prompt_ce_w}, "
+        f"ReduceLROnPlateau(monitor=val_dice, factor={lr_factor}, patience={lr_patience}, min_lr={lr_min})"
+    )
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -252,9 +237,6 @@ def train(
 
     files = make_pairs(os.path.join(data_root, "imagesTr"), os.path.join(data_root, "labelsTr"))
     random.shuffle(files)
-
-    # train_files = files
-    # val_files = files
 
     if len(files) < 2:
         train_files = files
@@ -276,7 +258,6 @@ def train(
 
         CropForegroundd(keys=["image", "label"], source_key="label"),
         SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
-        # What is this for ? TODO READ
         CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size),
 
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
@@ -291,19 +272,15 @@ def train(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=list_data_collate)
     val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=list_data_collate)
 
-    # UNet: multi-class
     model = UNet(
         spatial_dims=3,
-        in_channels=1 + kmax,   # CT + kmax prompt one-hot channels
-        out_channels=1 + kmax,  # background + kmax prompted labels
+        in_channels=1 + kmax,
+        out_channels=1 + kmax,
         channels=(32, 64, 128, 256),
         strides=(2, 2, 2),
         num_res_units=2,
     ).to(device)
 
-    # Dice + CE combined, multi-class
-    # - softmax=True because multi-class
-    # - to_onehot_y=True expects y as integer (B,1,D,H,W) or (B,D,H,W) depending; we will give (B,1,...) below
     seg_loss = DiceCELoss(
         softmax=True,
         to_onehot_y=True,
@@ -314,21 +291,30 @@ def train(
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
+    # ✅ Reduce LR when validation Dice plateaus
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt,
+        mode="max",  # maximize Dice
+        factor=lr_factor,
+        patience=lr_patience,
+        threshold=lr_threshold,
+        threshold_mode="rel",
+        cooldown=0,
+        min_lr=lr_min,
+        verbose=True,
+    )
+
     best_val = -1.0
 
     for epoch in range(1, epochs + 1):
         # ---------- TRAIN ----------
         model.train()
-        epoch_loss = 0.0
-        steps = 0
+        train_loss_sum = 0.0
 
         for step, batch in enumerate(train_loader):
-            
-            
-            ct = batch["image"].to(device)   # (B,1,D,H,W)
-            gt_parts = batch["label"].to(device)  # (B,1,D,H,W) int parts
+            ct = batch["image"].to(device)         # (B,1,D,H,W)
+            gt_parts = batch["label"].to(device)   # (B,1,D,H,W)
 
-            # build prompt + remapped target per item
             prompt_oh_list = []
             target_list = []
             prompt_int_list = []
@@ -342,19 +328,18 @@ def train(
                     click_radius=(3, 8),
                     p_empty=0.05,
                 )
-                prompt_oh_list.append(prompt_oh)      # (kmax,D,H,W)
-                target_list.append(target_int)        # (D,H,W)
-                prompt_int_list.append(prompt_int)    # (D,H,W)
+                prompt_oh_list.append(prompt_oh)
+                target_list.append(target_int)
+                prompt_int_list.append(prompt_int)
 
             prompt_oh = torch.stack(prompt_oh_list, dim=0).to(device)             # (B,kmax,D,H,W)
             target_int = torch.stack(target_list, dim=0).unsqueeze(1).to(device)  # (B,1,D,H,W)
             prompt_int = torch.stack(prompt_int_list, dim=0).to(device)           # (B,D,H,W)
 
-            # concatenate input: CT + prompt_onehot
             x = torch.cat([ct, prompt_oh], dim=1)  # (B,1+kmax,D,H,W)
 
             opt.zero_grad(set_to_none=True)
-            logits = model(x)  # (B,1+kmax,D,H,W)
+            logits = model(x)
 
             loss_seg = seg_loss(logits, target_int)
             loss_prompt = prompt_click_consistency_ce(logits, prompt_int)
@@ -362,48 +347,46 @@ def train(
 
             loss.backward()
             opt.step()
-            
-            if step % 20 == 0:
-                print(f"Epoch {epoch} step {step}/{len(train_loader)} loss{loss.item():.4f}", flush=True)
 
-            epoch_loss += float(loss.detach().item())
-            steps += 1
+            if step % 20 == 0:
+                print(f"Epoch {epoch} step {step}/{len(train_loader)} loss={loss.item():.4f}", flush=True)
+
+            train_loss_sum += loss.item()
 
             if epoch == 1 and step == 0:
                 with torch.no_grad():
-                    pred = torch.argmax(logits, dim=1)  # (B,D,H,W)
+                    pred = torch.argmax(logits, dim=1)
                     print("DEBUG shapes:",
                           "ct", tuple(ct.shape),
                           "prompt_oh", tuple(prompt_oh.shape),
                           "x", tuple(x.shape),
                           "logits", tuple(logits.shape),
                           "target_int", tuple(target_int.shape))
-                    print("DEBUG prompted voxels ratio:",
-                          float((prompt_int > 0).float().mean().item()))
-                    print("DEBUG pred unique (first item):",
-                          torch.unique(pred[0]).detach().cpu().numpy()[:20])
+                    print("DEBUG prompted voxels ratio:", float((prompt_int > 0).float().mean().item()))
+                    print("DEBUG pred unique (first item):", torch.unique(pred[0]).detach().cpu().numpy()[:20])
 
-        epoch_loss /= max(1, steps)
-        #logging
-        writer.add_scalar("loss/train", epoch_loss, epoch)
+        mean_train_loss = train_loss_sum / max(1, len(train_loader))
+        writer.add_scalar("loss/train", mean_train_loss, epoch)
+
+        # ✅ Log LR every epoch to TensorBoard (plotting LR)
+        current_lr = opt.param_groups[0]["lr"]
+        writer.add_scalar("lr", current_lr, epoch)
 
         mean_dice_fg = None
+        mean_val_loss = None
 
         # ---------- VAL ----------
-        mean_dice_fg = None
         if (epoch % val_every) == 0:
             model.eval()
-            dices = []
-
-            val_losses = []
-
+            val_loss_sum = 0.0
+            dice_sum = 0.0
+            n_val_batches = 0
 
             with torch.no_grad():
                 for batch in val_loader:
                     ct = batch["image"].to(device)
                     gt_parts = batch["label"].to(device)
 
-                    # simulate prompts on val too (interactive evaluation)
                     prompt_oh_list = []
                     target_list = []
                     prompt_int_list = []
@@ -426,33 +409,40 @@ def train(
 
                     logits = model(x)
 
-                    # seg loss on val (same as train)
                     val_target_int = target_int.unsqueeze(1)  # (B,1,D,H,W)
                     loss_v = seg_loss(logits, val_target_int)
-                    val_losses.append(float(loss_v.item()))
+                    val_loss_sum += loss_v.item()
 
                     pred = torch.argmax(logits, dim=1)  # (B,D,H,W)
 
-                    # Evaluate foreground union dice: (pred>0) vs (target>0)
+                    # foreground union dice
                     pred_fg = (pred > 0).float()
                     tgt_fg = (target_int > 0).float()
                     inter = (pred_fg * tgt_fg).sum(dim=(1, 2, 3))
                     denom = pred_fg.sum(dim=(1, 2, 3)) + tgt_fg.sum(dim=(1, 2, 3))
                     dice = (2 * inter / (denom + 1e-8))
-                    dices.append(float(dice.mean().item()))
 
-            mean_dice_fg = float(np.mean(dices)) if len(dices) else 0.0
+                    dice_sum += dice.mean().item()
+                    n_val_batches += 1
 
-            mean_val_loss = float(np.mean(val_losses)) if len(val_losses) else 0.0
+            mean_val_loss = val_loss_sum / max(1, n_val_batches)
+            mean_dice_fg = dice_sum / max(1, n_val_batches)
+
             writer.add_scalar("loss/val", mean_val_loss, epoch)
             writer.add_scalar("dice/val_fg_union", mean_dice_fg, epoch)
 
-        msg = f"Epoch {epoch:03d} | loss={epoch_loss:.4f}"
+            # ✅ ReduceLROnPlateau step on validation Dice
+            scheduler.step(mean_dice_fg)
+
+            # (optional) log LR again after scheduler step, to see immediate drop at val epochs
+            current_lr = opt.param_groups[0]["lr"]
+            writer.add_scalar("lr_after_val", current_lr, epoch)
+
+        msg = f"Epoch {epoch:03d} | train_loss={mean_train_loss:.4f} | lr={opt.param_groups[0]['lr']:.2e}"
         if mean_dice_fg is not None:
             msg += f" | val_loss={mean_val_loss:.4f} | val_fg_union_dice={mean_dice_fg:.4f}"
         print(msg)
 
-        
         # ---------- SAVE ----------
         if (epoch % save_every) == 0 or epoch == epochs:
             ckpt_path = os.path.join(out_dir, f"model_epoch_{epoch:03d}.pth")
@@ -465,8 +455,7 @@ def train(
             torch.save(model.state_dict(), best_path)
             print(f"New best val={best_val:.4f} -> Saved:", best_path)
 
-    writer.close()    
-
+    writer.close()
 
 
 if __name__ == "__main__":
@@ -483,8 +472,11 @@ if __name__ == "__main__":
         seed=0,
         save_every=25,
         val_every=10,
-        prompt_ce_w=0.5,  # tune 0.2..1.0
+        prompt_ce_w=0.5,
+
+        # ReduceLROnPlateau tuning:
+        lr_factor=0.5,
+        lr_patience=3,   # with val_every=10 -> ~30 epochs without dice improvement before LR drops
+        lr_min=1e-6,
+        lr_threshold=1e-4,
     )
-    #Plotten loss and validation loss tracken
-    #Logging wiht tensorboard oder weight and slices 
-    #What is the exactly archtecture of the 3DUnet von nnInterractive
