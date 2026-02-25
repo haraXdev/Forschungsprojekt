@@ -1,337 +1,490 @@
-import os
-from pathlib import Path
+"""
+trainer_interactive_labeled_clicks_unet.py
 
-# ============================================================
-# HARD STARTUP DEBUG (to prove which file is running + where)
-# ============================================================
-print("=== START inference.py (UPDATED DEBUG) ===", flush=True)
-print("SCRIPT PATH:", Path(__file__).resolve(), flush=True)
-print("CWD:", Path.cwd().resolve(), flush=True)
+Interactive trainer (as discussed):
 
-# Force debug log to live NEXT TO THIS SCRIPT (absolute path)
-DEBUG_LOG_PATH = Path(__file__).resolve().parent / "debug_log.txt"
-DEBUG_LOG_PATH.write_text("=== debug log created at startup ===\n", encoding="utf-8")
-print("DEBUG_LOG_PATH:", DEBUG_LOG_PATH, flush=True)
-# ============================================================
+Input:
+  - CT volume (1 channel)
+  - Prompt mask where the user "clicks" voxels and assigns LABEL IDs (1..K)
+    * Labels have NO global meaning across volumes.
+    * They are just IDs for "the region I clicked as label i" in THIS volume.
 
+How we make this trainable:
+  - We fix a maximum number of interactive labels: KMAX (default 8).
+  - We convert the integer prompt mask into KMAX one-hot channels.
+  - So model input channels = 1 + KMAX.
+
+Output:
+  - Multi-class segmentation with (KMAX + 1) channels:
+      0 = background
+      1..KMAX = prompted regions
+  - Note: during each training step we only prompt a subset of GT parts and remap them
+    to labels 1..k (k <= KMAX). All other parts become background for that step.
+    This forces the model to learn "seeded region growing" from CT + prompts.
+
+Loss:
+  - DiceCE (multi-class) over the dense target
+  - Prompt consistency CE loss on ONLY the prompted voxels (so clicks strongly affect output)
+
+Data layout (nnU-Net raw):
+  <data_root>/
+    imagesTr/
+      case_0000_0000.nii.gz
+    labelsTr/
+      case_0000.nii.gz   (0=background, 1..N parts within this sample)
+
+Run:
+  python trainer_interactive_labeled_clicks_unet.py
+"""
+
+import os, glob, random, re
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+
 import torch
-import napari
-from magicgui import magicgui
-import nibabel as nib
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
+from monai.transforms import (
+    Compose, LoadImaged, EnsureChannelFirstd, Orientationd, EnsureTyped,
+    ScaleIntensityd, CropForegroundd, SpatialPadd, CenterSpatialCropd,
+    RandFlipd, RandRotate90d,
+)
+from monai.data import CacheDataset, list_data_collate
 from monai.networks.nets import UNet
-from monai.inferers import sliding_window_inference
+from monai.losses import DiceCELoss
 
-from napari.utils.notifications import show_info
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_epoch_075.pth")
-INPUT_IMAGE_PATH      = Path(r"C:/uniDev/fProject/inference/image/case_0007_0000.nii")
-
-KMAX = 8
-PATCH_SIZE = (64, 64, 64)      # must match training patch_size
-SW_BATCH_SIZE = 2              # adjust for your VRAM
-OVERLAP = 0.25                 # typical
-FORCE_CPU = False
-
-# Prompt-ROI settings (recommended for your training distribution)
-PROMPT_MARGIN = 24             # voxels around prompts
-# ============================================================
+from scipy import ndimage as ndi
 
 
-def log(msg: str):
-    print(msg, flush=True)
-    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
+# -------------------------
+# 0) utils
+# -------------------------
+def set_seed(seed: int = 0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def build_model(kmax: int = 8):
-    return UNet(
+def make_pairs(images_dir, labels_dir):
+    imgs = sorted(glob.glob(os.path.join(images_dir, "*.nii*")))
+    if len(imgs) == 0:
+        raise RuntimeError(f"No NIfTI files found in {images_dir}")
+
+    data = []
+    for img in imgs:
+        base = os.path.basename(img)
+
+        # remove ONLY the final "_0000" (or "_0001", etc.) before the extension
+        label_base = re.sub(r'_\d{4}(?=\.nii(\.gz)?$)', '', base)
+
+        lbl = os.path.join(labels_dir, label_base)
+
+        # if not os.path.exists(lbl):
+        #     raise FileNotFoundError(f"Label missing for {img}: expected {lbl}")
+
+        data.append({"image": img, "label": lbl})
+    return data
+
+
+def _draw_ball_u8(mask_u8: np.ndarray, center_zyx, radius: int):
+    """mask_u8: (D,H,W) uint8. center_zyx: (z,y,x)."""
+    D, H, W = mask_u8.shape
+    cz, cy, cx = center_zyx
+    z0, z1 = max(0, cz - radius), min(D, cz + radius + 1)
+    y0, y1 = max(0, cy - radius), min(H, cy + radius + 1)
+    x0, x1 = max(0, cx - radius), min(W, cx + radius + 1)
+
+    zz, yy, xx = np.ogrid[z0:z1, y0:y1, x0:x1]
+    ball = (zz - cz) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2 <= radius ** 2
+    mask_u8[z0:z1, y0:y1, x0:x1][ball] = 1
+    return mask_u8
+
+
+# -------------------------
+# 1) prompt simulation + remapped target
+# -------------------------
+def simulate_prompt_and_target_from_parts(
+    parts_label_1dhw: torch.Tensor,
+    kmax: int = 8,
+    k_range=(2, 5),
+    clicks_per_label=(1, 3),
+    click_radius=(1, 3),
+    p_empty=0.05,
+):
+    """
+    parts_label_1dhw: (1,D,H,W) int. 0=bg, 1..N parts
+    Returns:
+      prompt_onehot: (kmax, D, H, W) float {0,1}
+      target_int:   (D, H, W) long in [0..kmax] (dense training target)
+      prompt_int:   (D, H, W) long in [0..kmax] (sparse prompt IDs at clicked voxels)
+    Semantics:
+      - We pick a random subset of GT parts and remap them to labels 1..k (k<=kmax).
+      - Only those chosen parts are "foreground classes" for this iteration.
+      - All other parts become background (0) for this iteration.
+    """
+    lbl = parts_label_1dhw[0].detach().cpu().numpy().astype(np.int32)  # (D,H,W)
+
+    # optionally no prompts: train automatic mode too
+    if np.random.rand() < p_empty:
+        D, H, W = lbl.shape
+        prompt_onehot = np.zeros((kmax, D, H, W), dtype=np.float32)
+        prompt_int = np.zeros((D, H, W), dtype=np.int64)
+        # In "no prompt" mode, we train object-vs-background union as class 1 (optional).
+        # But that would introduce semantics. So instead we train "background only" which is useless.
+        # Better: still do prompted training mostly. We'll simply return empty prompts and use
+        # a remapped target with k=1 on union object so it learns an auto fallback without semantics:
+        target_int = np.zeros((D, H, W), dtype=np.int64)
+        target_int[lbl > 0] = 1
+        # set channel for label 1 empty (no clicks), still ok
+        return (
+            torch.from_numpy(prompt_onehot),
+            torch.from_numpy(target_int),
+            torch.from_numpy(prompt_int),
+        )
+
+    part_ids = np.unique(lbl)
+    part_ids = part_ids[part_ids != 0]
+    if part_ids.size == 0:
+        D, H, W = lbl.shape
+        prompt_onehot = np.zeros((kmax, D, H, W), dtype=np.float32)
+        prompt_int = np.zeros((D, H, W), dtype=np.int64)
+        target_int = np.zeros((D, H, W), dtype=np.int64)
+        return (
+            torch.from_numpy(prompt_onehot),
+            torch.from_numpy(target_int),
+            torch.from_numpy(prompt_int),
+        )
+
+    # choose k parts
+    k_hi = min(k_range[1], int(part_ids.size), kmax)
+    k_lo = min(k_range[0], k_hi)
+    k = np.random.randint(k_lo, k_hi + 1) if k_hi >= k_lo else k_hi
+    chosen = np.random.choice(part_ids, size=k, replace=False)
+
+    # map chosen GT part IDs -> prompt IDs 1..k
+    mapping = {int(pid): (i + 1) for i, pid in enumerate(chosen)}
+
+    D, H, W = lbl.shape
+    target_int = np.zeros((D, H, W), dtype=np.int64)
+    for pid, new_id in mapping.items():
+        target_int[lbl == pid] = new_id
+
+    # sparse prompt clicks (integer IDs)
+    prompt_int = np.zeros((D, H, W), dtype=np.int64)
+    for pid, new_id in mapping.items():
+        vox = np.argwhere(lbl == pid)
+        if vox.shape[0] == 0:
+            continue
+        n_clicks = np.random.randint(clicks_per_label[0], clicks_per_label[1] + 1)
+        for _ in range(n_clicks):
+            cz, cy, cx = vox[np.random.randint(vox.shape[0])]
+            r = np.random.randint(click_radius[0], click_radius[1] + 1)
+            tmp = np.zeros((D, H, W), dtype=np.uint8)
+            _draw_ball_u8(tmp, (int(cz), int(cy), int(cx)), int(r))
+            # write label id where the ball is
+            prompt_int[tmp > 0] = new_id
+
+    # one-hot encode prompt into kmax channels
+    prompt_onehot = np.zeros((kmax, D, H, W), dtype=np.float32)
+    for c in range(1, kmax + 1):
+        prompt_onehot[c - 1] = (prompt_int == c).astype(np.float32)
+
+    return (
+        torch.from_numpy(prompt_onehot),      # (kmax,D,H,W)
+        torch.from_numpy(target_int),         # (D,H,W)
+        torch.from_numpy(prompt_int),         # (D,H,W)
+    )
+
+
+def prompt_click_consistency_ce(
+    logits: torch.Tensor,
+    prompt_int: torch.Tensor,
+):
+    """
+    Enforce that on clicked voxels the predicted class matches the prompt ID.
+
+    logits:     (B, C, D, H, W) where C = kmax+1
+    prompt_int: (B, D, H, W) long in [0..kmax], sparse (>0 only at clicks)
+    """
+    # only where prompt_int > 0
+    m = prompt_int > 0  # (B,D,H,W)
+    if not m.any():
+        return logits.new_tensor(0.0)
+
+    # flatten selected voxels
+    # logits: (B,C,D,H,W) -> (N,C)
+    sel_logits = logits.permute(0, 2, 3, 4, 1)[m]   # (N,C)
+    sel_target = prompt_int[m]                      # (N,)
+    return F.cross_entropy(sel_logits, sel_target, reduction="mean")
+
+
+# -------------------------
+# 2) training loop
+# -------------------------
+def train(
+    data_root: str,
+    out_dir: str = "./runs_clickprompts",
+    kmax: int = 8,
+    patch_size=(64, 64, 64),
+    batch_size: int = 1,
+    epochs: int = 300,
+    lr: float = 1e-3,
+    device: str = None,
+    cache_rate: float = 0.2,
+    seed: int = 0,
+    save_every: int = 25,
+    val_every: int = 1,
+    prompt_ce_w: float = 0.5,
+):
+    set_seed(seed)
+    os.makedirs(out_dir, exist_ok=True)
+
+    tb_dir = os.path.join(out_dir, "tb")
+    writer = SummaryWriter(log_dir=tb_dir)
+
+    writer.add_text("hparams", f"kmax={kmax}, patch_size={patch_size}, lr={lr}, prompt_ce_w={prompt_ce_w}")
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+
+    files = make_pairs(os.path.join(data_root, "imagesTr"), os.path.join(data_root, "labelsTr"))
+    random.shuffle(files)
+
+    # train_files = files
+    # val_files = files
+
+    if len(files) < 2:
+        train_files = files
+        val_files = files
+    else:
+        n_val = max(1, int(0.2 * len(files)))
+        val_files = files[:n_val]
+        train_files = files[n_val:] if len(files[n_val:]) > 0 else files
+
+    print(f"Found total: {len(files)} | train: {len(train_files)} | val: {len(val_files)}")
+    print(f"KMAX={kmax} -> in_channels={1+kmax}, out_channels={1+kmax}")
+
+    tf = Compose([
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        ScaleIntensityd(keys=["image"]),
+        EnsureTyped(keys=["image", "label"]),
+
+        CropForegroundd(keys=["image", "label"], source_key="label"),
+        SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
+        # What is this for ? TODO READ
+        CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size),
+
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
+        RandRotate90d(keys=["image", "label"], prob=0.25, max_k=3),
+    ])
+
+    train_ds = CacheDataset(train_files, transform=tf, cache_rate=cache_rate, num_workers=0)
+    val_ds   = CacheDataset(val_files,   transform=tf, cache_rate=cache_rate, num_workers=0)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=list_data_collate)
+    val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=list_data_collate)
+
+    # UNet: multi-class
+    model = UNet(
         spatial_dims=3,
-        in_channels=1 + kmax,
-        out_channels=1 + kmax,
+        in_channels=1 + kmax,   # CT + kmax prompt one-hot channels
+        out_channels=1 + kmax,  # background + kmax prompted labels
         channels=(32, 64, 128, 256),
         strides=(2, 2, 2),
         num_res_units=2,
+    ).to(device)
+
+    # Dice + CE combined, multi-class
+    # - softmax=True because multi-class
+    # - to_onehot_y=True expects y as integer (B,1,D,H,W) or (B,D,H,W) depending; we will give (B,1,...) below
+    seg_loss = DiceCELoss(
+        softmax=True,
+        to_onehot_y=True,
+        include_background=True,
+        lambda_dice=1.0,
+        lambda_ce=1.0,
     )
 
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
-def load_state_dict_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: torch.device):
-    state = torch.load(str(ckpt_path), map_location=device)
+    best_val = -1.0
 
-    # allow nested formats
-    if isinstance(state, dict):
-        for key in ["state_dict", "model_state_dict", "model", "net", "network"]:
-            if key in state and isinstance(state[key], dict):
-                state = state[key]
-                break
+    for epoch in range(1, epochs + 1):
+        # ---------- TRAIN ----------
+        model.train()
+        epoch_loss = 0.0
+        steps = 0
 
-    # strip common outer prefixes if present
-    cleaned = {}
-    for k, v in state.items():
-        for prefix in ["model.", "net.", "network."]:
-            if k.startswith(prefix):
-                k = k[len(prefix):]
-        cleaned[k] = v
+        for step, batch in enumerate(train_loader):
+            
+            
+            ct = batch["image"].to(device)   # (B,1,D,H,W)
+            gt_parts = batch["label"].to(device)  # (B,1,D,H,W) int parts
 
-    # ---- AUTO-FIX PREFIX MISMATCH ----
-    model_keys = list(model.state_dict().keys())
-    if not model_keys:
-        raise RuntimeError("Model has no state_dict keys?")
+            # build prompt + remapped target per item
+            prompt_oh_list = []
+            target_list = []
+            prompt_int_list = []
 
-    expects_model_prefix = model_keys[0].startswith("model.")
-    ckpt_has_model_prefix = next(iter(cleaned.keys())).startswith("model.")
+            for b in range(ct.shape[0]):
+                prompt_oh, target_int, prompt_int = simulate_prompt_and_target_from_parts(
+                    gt_parts[b],
+                    kmax=kmax,
+                    k_range=(2, 5),
+                    clicks_per_label=(5, 10),
+                    click_radius=(3, 8),
+                    p_empty=0.05,
+                )
+                prompt_oh_list.append(prompt_oh)      # (kmax,D,H,W)
+                target_list.append(target_int)        # (D,H,W)
+                prompt_int_list.append(prompt_int)    # (D,H,W)
 
-    if expects_model_prefix and not ckpt_has_model_prefix:
-        cleaned = {f"model.{k}": v for k, v in cleaned.items()}
+            prompt_oh = torch.stack(prompt_oh_list, dim=0).to(device)             # (B,kmax,D,H,W)
+            target_int = torch.stack(target_list, dim=0).unsqueeze(1).to(device)  # (B,1,D,H,W)
+            prompt_int = torch.stack(prompt_int_list, dim=0).to(device)           # (B,D,H,W)
 
-    if (not expects_model_prefix) and ckpt_has_model_prefix:
-        cleaned = {k[len("model."):]: v for k, v in cleaned.items()}
+            # concatenate input: CT + prompt_onehot
+            x = torch.cat([ct, prompt_oh], dim=1)  # (B,1+kmax,D,H,W)
 
-    missing, unexpected = model.load_state_dict(cleaned, strict=False)
-    if missing:
-        log(f"[WARN] Missing keys (up to 10): {missing[:10]}")
-    if unexpected:
-        log(f"[WARN] Unexpected keys (up to 10): {unexpected[:10]}")
+            opt.zero_grad(set_to_none=True)
+            logits = model(x)  # (B,1+kmax,D,H,W)
 
-    model.to(device).eval()
-    return model
+            loss_seg = seg_loss(logits, target_int)
+            loss_prompt = prompt_click_consistency_ce(logits, prompt_int)
+            loss = loss_seg + prompt_ce_w * loss_prompt
 
+            loss.backward()
+            opt.step()
+            
+            if step % 20 == 0:
+                print(f"Epoch {epoch} step {step}/{len(train_loader)} loss{loss.item():.4f}", flush=True)
 
-def load_nifti_as_ras_zyx(path: Path) -> np.ndarray:
-    img = nib.load(str(path))
-    img = nib.as_closest_canonical(img)
-    vol_xyz = img.get_fdata().astype(np.float32)   # (X,Y,Z)
-    vol_zyx = np.transpose(vol_xyz, (2, 1, 0))     # (Z,Y,X)
-    return vol_zyx
+            epoch_loss += float(loss.detach().item())
+            steps += 1
 
+            if epoch == 1 and step == 0:
+                with torch.no_grad():
+                    pred = torch.argmax(logits, dim=1)  # (B,D,H,W)
+                    print("DEBUG shapes:",
+                          "ct", tuple(ct.shape),
+                          "prompt_oh", tuple(prompt_oh.shape),
+                          "x", tuple(x.shape),
+                          "logits", tuple(logits.shape),
+                          "target_int", tuple(target_int.shape))
+                    print("DEBUG prompted voxels ratio:",
+                          float((prompt_int > 0).float().mean().item()))
+                    print("DEBUG pred unique (first item):",
+                          torch.unique(pred[0]).detach().cpu().numpy()[:20])
 
-def scale_intensity_minmax_like_monai(vol: np.ndarray) -> np.ndarray:
-    vmin = float(np.min(vol))
-    vmax = float(np.max(vol))
-    if vmax <= vmin + 1e-8:
-        return np.zeros_like(vol, dtype=np.float32)
-    out = (vol - vmin) / (vmax - vmin)
-    return out.astype(np.float32)
+        epoch_loss /= max(1, steps)
+        #logging
+        writer.add_scalar("loss/train", epoch_loss, epoch)
 
+        mean_dice_fg = None
 
-def prompt_int_to_onehot(prompt_int_zyx: np.ndarray, kmax: int) -> np.ndarray:
-    oh = np.zeros((kmax,) + prompt_int_zyx.shape, dtype=np.float32)
-    for c in range(1, kmax + 1):
-        oh[c - 1] = (prompt_int_zyx == c).astype(np.float32)
-    return oh
+        # ---------- VAL ----------
+        mean_dice_fg = None
+        if (epoch % val_every) == 0:
+            model.eval()
+            dices = []
 
-
-def bbox_from_mask(mask_zyx: np.ndarray, margin: int):
-    zs, ys, xs = np.where(mask_zyx > 0)
-    if zs.size == 0:
-        return None
-    z0, z1 = int(zs.min()), int(zs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-
-    z0 = max(0, z0 - margin)
-    y0 = max(0, y0 - margin)
-    x0 = max(0, x0 - margin)
-    z1 = min(mask_zyx.shape[0], z1 + margin)
-    y1 = min(mask_zyx.shape[1], y1 + margin)
-    x1 = min(mask_zyx.shape[2], x1 + margin)
-
-    return (z0, z1, y0, y1, x0, x1)
-
-
-def pad_to_min_size(vol_zyx: np.ndarray, min_size=(64, 64, 64), constant=0):
-    z, y, x = vol_zyx.shape
-    pz = max(0, min_size[0] - z)
-    py = max(0, min_size[1] - y)
-    px = max(0, min_size[2] - x)
-
-    pad = (
-        (pz // 2, pz - pz // 2),
-        (py // 2, py - py // 2),
-        (px // 2, px - px // 2),
-    )
-    vol_p = np.pad(vol_zyx, pad, mode="constant", constant_values=constant)
-    return vol_p, pad
+            val_losses = []
 
 
-def unpad(vol_zyx: np.ndarray, pad):
-    (z0, z1), (y0, y1), (x0, x1) = pad
-    z_slice = slice(z0, vol_zyx.shape[0] - z1 if z1 > 0 else vol_zyx.shape[0])
-    y_slice = slice(y0, vol_zyx.shape[1] - y1 if y1 > 0 else vol_zyx.shape[1])
-    x_slice = slice(x0, vol_zyx.shape[2] - x1 if x1 > 0 else vol_zyx.shape[2])
-    return vol_zyx[z_slice, y_slice, x_slice]
+            with torch.no_grad():
+                for batch in val_loader:
+                    ct = batch["image"].to(device)
+                    gt_parts = batch["label"].to(device)
 
+                    # simulate prompts on val too (interactive evaluation)
+                    prompt_oh_list = []
+                    target_list = []
+                    prompt_int_list = []
+                    for b in range(ct.shape[0]):
+                        prompt_oh, target_int, prompt_int = simulate_prompt_and_target_from_parts(
+                            gt_parts[b],
+                            kmax=kmax,
+                            k_range=(2, 5),
+                            clicks_per_label=(5, 10),
+                            click_radius=(3, 8),
+                            p_empty=0.05,
+                        )
+                        prompt_oh_list.append(prompt_oh)
+                        target_list.append(target_int)
+                        prompt_int_list.append(prompt_int)
 
-@torch.inference_mode()
-def run_model_sliding_window(
-    model: torch.nn.Module,
-    ct_zyx: np.ndarray,
-    prompt_int_zyx: np.ndarray,
-    device: torch.device,
-    kmax: int,
-):
-    prompt_oh = prompt_int_to_onehot(prompt_int_zyx, kmax)
-    x = np.concatenate([ct_zyx[None, ...], prompt_oh], axis=0).astype(np.float32)
-    x_t = torch.from_numpy(x)[None, ...].to(device)
+                    prompt_oh = torch.stack(prompt_oh_list, dim=0).to(device)
+                    target_int = torch.stack(target_list, dim=0).to(device)  # (B,D,H,W)
+                    x = torch.cat([ct, prompt_oh], dim=1)
 
-    logits = sliding_window_inference(
-        inputs=x_t,
-        roi_size=PATCH_SIZE,
-        sw_batch_size=SW_BATCH_SIZE,
-        predictor=model,
-        overlap=OVERLAP,
-        mode="gaussian",
-        padding_mode="constant",
-        cval=0.0,
-    )
+                    logits = model(x)
 
-    probs = torch.softmax(logits, dim=1)[0]
-    pred = torch.argmax(probs, dim=0).detach().cpu().numpy().astype(np.int32)
+                    # seg loss on val (same as train)
+                    val_target_int = target_int.unsqueeze(1)  # (B,1,D,H,W)
+                    loss_v = seg_loss(logits, val_target_int)
+                    val_losses.append(float(loss_v.item()))
 
-    p_bg = probs[0].detach().cpu().numpy().astype(np.float32)
-    fg_prob = (1.0 - p_bg).astype(np.float32)
-    return pred, fg_prob
+                    pred = torch.argmax(logits, dim=1)  # (B,D,H,W)
 
+                    # Evaluate foreground union dice: (pred>0) vs (target>0)
+                    pred_fg = (pred > 0).float()
+                    tgt_fg = (target_int > 0).float()
+                    inter = (pred_fg * tgt_fg).sum(dim=(1, 2, 3))
+                    denom = pred_fg.sum(dim=(1, 2, 3)) + tgt_fg.sum(dim=(1, 2, 3))
+                    dice = (2 * inter / (denom + 1e-8))
+                    dices.append(float(dice.mean().item()))
 
-@torch.inference_mode()
-def run_prompt_roi_inference(
-    model: torch.nn.Module,
-    ct_zyx: np.ndarray,
-    prompt_int_zyx: np.ndarray,
-    device: torch.device,
-    kmax: int,
-    margin: int = 24,
-):
-    bb = bbox_from_mask(prompt_int_zyx, margin=margin)
-    if bb is None:
-        pred_full = np.zeros_like(prompt_int_zyx, dtype=np.int32)
-        fg_full = np.zeros_like(ct_zyx, dtype=np.float32)
-        return pred_full, fg_full
+            mean_dice_fg = float(np.mean(dices)) if len(dices) else 0.0
 
-    z0, z1, y0, y1, x0, x1 = bb
-    ct_roi = ct_zyx[z0:z1, y0:y1, x0:x1]
-    pr_roi = prompt_int_zyx[z0:z1, y0:y1, x0:x1]
+            mean_val_loss = float(np.mean(val_losses)) if len(val_losses) else 0.0
+            writer.add_scalar("loss/val", mean_val_loss, epoch)
+            writer.add_scalar("dice/val_fg_union", mean_dice_fg, epoch)
 
-    ct_roi_p, pad_ct = pad_to_min_size(ct_roi, PATCH_SIZE, constant=0.0)
-    pr_roi_p, _ = pad_to_min_size(pr_roi, PATCH_SIZE, constant=0)
+        msg = f"Epoch {epoch:03d} | loss={epoch_loss:.4f}"
+        if mean_dice_fg is not None:
+            msg += f" | val_loss={mean_val_loss:.4f} | val_fg_union_dice={mean_dice_fg:.4f}"
+        print(msg)
 
-    pred_roi_p, fg_roi_p = run_model_sliding_window(model, ct_roi_p, pr_roi_p, device, kmax)
+        
+        # ---------- SAVE ----------
+        if (epoch % save_every) == 0 or epoch == epochs:
+            ckpt_path = os.path.join(out_dir, f"model_epoch_{epoch:03d}.pth")
+            torch.save(model.state_dict(), ckpt_path)
+            print("Saved:", ckpt_path)
 
-    pred_roi = unpad(pred_roi_p, pad_ct)
-    fg_roi = unpad(fg_roi_p, pad_ct)
+        if mean_dice_fg is not None and mean_dice_fg > best_val:
+            best_val = mean_dice_fg
+            best_path = os.path.join(out_dir, "model_best.pth")
+            torch.save(model.state_dict(), best_path)
+            print(f"New best val={best_val:.4f} -> Saved:", best_path)
 
-    pred_full = np.zeros_like(prompt_int_zyx, dtype=np.int32)
-    fg_full = np.zeros_like(ct_zyx, dtype=np.float32)
+    writer.close()    
 
-    pred_full[z0:z1, y0:y1, x0:x1] = pred_roi
-    fg_full[z0:z1, y0:y1, x0:x1] = fg_roi
-    return pred_full, fg_full
-
-
-def main():
-    device = torch.device("cpu" if FORCE_CPU or not torch.cuda.is_available() else "cuda")
-    log(f"Using device: {device}")
-
-    if not MODEL_CHECKPOINT_PATH.exists():
-        raise FileNotFoundError(MODEL_CHECKPOINT_PATH)
-    if not INPUT_IMAGE_PATH.exists():
-        raise FileNotFoundError(INPUT_IMAGE_PATH)
-
-    ct_zyx = load_nifti_as_ras_zyx(INPUT_IMAGE_PATH)
-    ct_zyx = scale_intensity_minmax_like_monai(ct_zyx)
-    prompt_zyx = np.zeros_like(ct_zyx, dtype=np.int32)
-
-    model = build_model(KMAX)
-    model = load_state_dict_checkpoint(model, MODEL_CHECKPOINT_PATH, device)
-
-    viewer = napari.Viewer(title="Interactive Click-Prompt UNet (Prompt-ROI Inference)")
-    viewer.add_image(ct_zyx, name="ct (RAS canonical, ZYX)", contrast_limits=(0, 1))
-
-    prompt_layer = viewer.add_labels(prompt_zyx, name="prompt")
-
-    pred_layer = viewer.add_labels(
-        np.zeros_like(prompt_zyx, dtype=np.int32),
-        name="pred",
-        opacity=0.6,
-    )
-
-    prob_layer = viewer.add_image(
-        np.zeros_like(ct_zyx, dtype=np.float32),
-        name="fg_prob",
-        opacity=0.5,
-        visible=False,
-    )
-
-    viewer.layers.selection.active = prompt_layer
-    prompt_layer.brush_size = 2
-    prompt_layer.selected_label = 1
-
-    @magicgui(
-        call_button="Run inference (prompt ROI)",
-        show_prob={"label": "Show fg_prob layer"},
-        clear_prompt={"label": "Clear prompt"},
-        selected_label={"label": "Selected prompt label", "min": 0, "max": KMAX},
-        margin={"label": "ROI margin (vox)", "min": 0, "max": 256},
-    )
-    def controls(
-        selected_label: int = 1,
-        show_prob: bool = False,
-        clear_prompt: bool = False,
-        margin: int = PROMPT_MARGIN,
-    ):
-        show_info("Inference button clicked")
-        log(">>> BUTTON CLICKED <<<")
-
-        prompt_layer.selected_label = int(selected_label)
-
-        if clear_prompt:
-            show_info("Prompt cleared")
-            prompt_layer.data[:] = 0
-            pred_layer.data[:] = 0
-            prob_layer.data[:] = 0
-            prompt_layer.refresh()
-            pred_layer.refresh()
-            prob_layer.refresh()
-            log(">>> PROMPT CLEARED <<<")
-            return
-
-        pr = prompt_layer.data.astype(np.int32)
-
-        # --- DEBUG ---
-        u, c = np.unique(pr, return_counts=True)
-        log(f"PROMPT unique: {list(zip(u.tolist(), c.tolist()))}")
-        oh = prompt_int_to_onehot(pr, KMAX)
-        log(f"prompt sum per channel: {[float(oh[i].sum()) for i in range(KMAX)]}")
-        # -----------
-
-        pred, fg_prob = run_prompt_roi_inference(
-            model=model,
-            ct_zyx=ct_zyx,
-            prompt_int_zyx=pr,
-            device=device,
-            kmax=KMAX,
-            margin=int(margin),
-        )
-
-        log(f"PRED unique: {np.unique(pred).tolist()}")
-
-        pred_layer.data = pred
-        pred_layer.refresh()
-
-        prob_layer.data = fg_prob
-        prob_layer.visible = bool(show_prob)
-        prob_layer.refresh()
-
-        show_info("Inference done. Open debug_log.txt next to inference.py")
-
-    viewer.window.add_dock_widget(controls, area="right", name="Inference Controls")
-    napari.run()
 
 
 if __name__ == "__main__":
-    main()
+    train(
+        data_root=r"/lgrp/edu-2025-2-brprj-segmentation/Forschungsprojekt/trainingsdata/Datasets/Dataset001_CT_Scans",
+        out_dir=r"./runs_clickprompts",
+        kmax=8,
+        patch_size=(64, 64, 64),
+        batch_size=1,
+        epochs=300,
+        lr=1e-3,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        cache_rate=1,
+        seed=0,
+        save_every=25,
+        val_every=10,
+        prompt_ce_w=0.5,  # tune 0.2..1.0
+    )
+    #Plotten loss and validation loss tracken
+    #Logging wiht tensorboard oder weight and slices 
+    #What is the exactly archtecture of the 3DUnet von nnInterractive
