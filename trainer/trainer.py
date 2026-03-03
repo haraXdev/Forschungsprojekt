@@ -416,7 +416,7 @@ def train(
                             kmax=kmax,
                             k_range=(2, 5),
                             clicks_per_label=(5, 10),
-                            click_radius=(3, 8),
+                            brush_size=4,
                             p_empty=0.05,
                         )
                         prompt_oh_list.append(prompt_oh)
