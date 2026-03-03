@@ -249,7 +249,7 @@ def train(
     writer.add_text(
         "hparams",
         f"kmax={kmax}, patch_size={patch_size}, init_lr={lr}, prompt_ce_w={prompt_ce_w}, "
-        f"ReduceLROnPlateau(monitor=val_dice, factor={lr_factor}, patience={lr_patience}, min_lr={lr_min})"
+        f"ReduceLROnPlateau(monitor=val_loss, factor={lr_factor}, patience={lr_patience}, min_lr={lr_min})"
     )
 
     if device is None:
@@ -315,7 +315,7 @@ def train(
     # ✅ Reduce LR when validation Dice plateaus
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt,
-        mode="max",  # maximize Dice
+        mode="min",  
         factor=lr_factor,
         patience=lr_patience,
         threshold=lr_threshold,
@@ -452,7 +452,7 @@ def train(
             writer.add_scalar("dice/val_fg_union", mean_dice_fg, epoch)
 
             # ✅ ReduceLROnPlateau step on validation Dice
-            scheduler.step(mean_dice_fg)
+            scheduler.step(mean_val_loss)
 
             # (optional) log LR again after scheduler step, to see immediate drop at val epochs
             current_lr = opt.param_groups[0]["lr"]
