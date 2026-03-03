@@ -78,17 +78,52 @@ def make_pairs(images_dir, labels_dir):
     return data
 
 
-def _draw_ball_u8(mask_u8: np.ndarray, center_zyx, radius: int):
-    """mask_u8: (D,H,W) uint8. center_zyx: (z,y,x)."""
+def draw_napari_click_u8(
+    mask_u8: np.ndarray,
+    center_zyx,
+    brush_size: int = 4,     # UI brush size (Durchmesser)
+    z_thickness: int = 0,    # 0 = nur aktueller Slice (napari-typisch)
+    jitter: float = 0.2,     # subpixel jitter in px (0.0..0.5 sinnvoll)
+    fray: float = 0.08,      # Rand "ausfransen" (0..0.2 sinnvoll)
+):
+    """
+    Napari-ähnlicher Brush-KLICK: 2D disk (circle) im Slice, optional +/- z_thickness Slices.
+    mask_u8: (D,H,W) uint8, wird in-place beschrieben (1en).
+    center_zyx: (z,y,x) int oder float
+    """
     D, H, W = mask_u8.shape
     cz, cy, cx = center_zyx
-    z0, z1 = max(0, cz - radius), min(D, cz + radius + 1)
-    y0, y1 = max(0, cy - radius), min(H, cy + radius + 1)
-    x0, x1 = max(0, cx - radius), min(W, cx + radius + 1)
 
-    zz, yy, xx = np.ogrid[z0:z1, y0:y1, x0:x1]
-    ball = (zz - cz) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2 <= radius ** 2
-    mask_u8[z0:z1, y0:y1, x0:x1][ball] = 1
+    # Napari-like: size ist Durchmesser -> radius
+    r = brush_size / 2.0
+
+    # kleines jitter, damit es nicht geometrisch perfekt wird
+    cy = float(cy) + np.random.uniform(-jitter, jitter)
+    cx = float(cx) + np.random.uniform(-jitter, jitter)
+    cz = int(round(float(cz)))
+
+    z0 = max(0, cz - z_thickness)
+    z1 = min(D, cz + z_thickness + 1)
+
+    for z in range(z0, z1):
+        y0 = max(0, int(np.floor(cy - r - 1)))
+        y1 = min(H, int(np.ceil (cy + r + 2)))
+        x0 = max(0, int(np.floor(cx - r - 1)))
+        x1 = min(W, int(np.ceil (cx + r + 2)))
+
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dist2 = (yy - cy) ** 2 + (xx - cx) ** 2
+        disk = dist2 <= (r ** 2)
+
+        # Rand etwas "fransen": nur nahe am Rand zufällig ein paar Pixel droppen
+        if fray > 0:
+            # ring: zwischen r-0.75 und r+0.75 (ungefähr der Randbereich)
+            ring = (dist2 >= max(0.0, (r - 0.75) ** 2)) & (dist2 <= (r + 0.75) ** 2)
+            drop = (np.random.rand(*disk.shape) < fray) & ring
+            disk = disk & (~drop)
+
+        mask_u8[z, y0:y1, x0:x1][disk] = 1
+
     return mask_u8
 
 
@@ -100,7 +135,7 @@ def simulate_prompt_and_target_from_parts(
     kmax: int = 8,
     k_range=(2, 5),
     clicks_per_label=(1, 3),
-    click_radius=(1, 3),
+    brush_size: int = 4,  
     p_empty=0.05,
 ):
     """
@@ -161,9 +196,8 @@ def simulate_prompt_and_target_from_parts(
         n_clicks = np.random.randint(clicks_per_label[0], clicks_per_label[1] + 1)
         for _ in range(n_clicks):
             cz, cy, cx = vox[np.random.randint(vox.shape[0])]
-            r = np.random.randint(click_radius[0], click_radius[1] + 1)
             tmp = np.zeros((D, H, W), dtype=np.uint8)
-            _draw_ball_u8(tmp, (int(cz), int(cy), int(cx)), int(r))
+            draw_napari_click_u8(tmp, (int(cz), int(cy), int(cx)), brush_size=brush_size)
             prompt_int[tmp > 0] = new_id
 
     # one-hot encode prompt into kmax channels
