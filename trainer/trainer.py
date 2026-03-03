@@ -147,19 +147,6 @@ def simulate_prompt_and_target_from_parts(
     """
     lbl = parts_label_1dhw[0].detach().cpu().numpy().astype(np.int32)  # (D,H,W)
 
-    # optionally no prompts: train fallback "foreground union" in class 1
-    if np.random.rand() < p_empty:
-        D, H, W = lbl.shape
-        prompt_onehot = np.zeros((kmax, D, H, W), dtype=np.float32)
-        prompt_int = np.zeros((D, H, W), dtype=np.int64)
-        target_int = np.zeros((D, H, W), dtype=np.int64)
-        target_int[lbl > 0] = 1
-        return (
-            torch.from_numpy(prompt_onehot),
-            torch.from_numpy(target_int),
-            torch.from_numpy(prompt_int),
-        )
-
     part_ids = np.unique(lbl)
     part_ids = part_ids[part_ids != 0]
     if part_ids.size == 0:
