@@ -314,7 +314,6 @@ def train(
         threshold_mode="rel",
         cooldown=0,
         min_lr=1e-6,
-        verbose=True,
     )
 
     best_val = -1.0
@@ -468,10 +467,12 @@ def train(
 
     writer.close()
 
+# data_root=r"/lgrp/edu-2025-2-brprj-segmentation/Forschungsprojekt/trainingsdata/Datasets/Dataset001_CT_Scans", Server Adress 
+# data_root=r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic", local Adress
 
 if __name__ == "__main__":
     train(
-        data_root=r"/lgrp/edu-2025-2-brprj-segmentation/Forschungsprojekt/trainingsdata/Datasets/Dataset001_CT_Scans",
+        data_root=r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic",
         out_dir=r"./runs_clickprompts",
         kmax=8,
         patch_size=(64, 64, 64),
