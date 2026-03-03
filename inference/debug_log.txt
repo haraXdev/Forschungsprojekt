@@ -1,6 +1,2 @@
 === debug log created at startup ===
 Using device: cpu
->>> BUTTON CLICKED <<<
-PROMPT(unique, after dilation): [(0, 16757555), (2, 6645), (3, 6371), (4, 6645)]
-prompt sum per channel (after dilation): [0.0, 6645.0, 6371.0, 6645.0, 0.0, 0.0, 0.0, 0.0]
-PRED unique: [0, 2, 3, 4]
