@@ -24,13 +24,12 @@ from monai.networks.nets import UNet
 from monai.inferers import sliding_window_inference
 
 from napari.utils.notifications import show_info
-from scipy import ndimage as ndi  # <-- FIX 1 needs this
 
 
 # ============================================================
 # CONFIG
 # ============================================================
-MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_epoch_075.pth")
+MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_epoch_300.pth")
 INPUT_IMAGE_PATH      = Path(r"C:/uniDev/fProject/inference/image/case_0005_0000.nii")
 
 KMAX = 8
@@ -39,9 +38,8 @@ SW_BATCH_SIZE = 2              # adjust for your VRAM
 OVERLAP = 0.25                 # typical
 FORCE_CPU = False
 
-# Prompt-ROI settings (recommended for your training distribution)
+# Prompt-ROI settings
 PROMPT_MARGIN = 24             # voxels around prompts
-DEFAULT_DILATE_RADIUS = 5      # <-- start with 5, try 4..8
 # ============================================================
 
 
@@ -126,37 +124,6 @@ def prompt_int_to_onehot(prompt_int_zyx: np.ndarray, kmax: int) -> np.ndarray:
     for c in range(1, kmax + 1):
         oh[c - 1] = (prompt_int_zyx == c).astype(np.float32)
     return oh
-
-
-# ============================================================
-# FIX 1: Make inference prompts look like training prompts
-# (training used balls radius ~3..8 and multiple clicks)
-# ============================================================
-def _spherical_se(radius: int) -> np.ndarray:
-    zz, yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1, -radius:radius+1]
-    return (zz * zz + yy * yy + xx * xx) <= radius * radius
-
-
-def dilate_prompts_per_label(prompt_int_zyx: np.ndarray, kmax: int, radius: int = 5) -> np.ndarray:
-    """
-    Dilate each label separately with a spherical-ish structuring element.
-    This approximates your training clicks (balls) and improves propagation.
-    """
-    if radius <= 0:
-        return prompt_int_zyx
-
-    se = _spherical_se(int(radius))
-    out = np.zeros_like(prompt_int_zyx, dtype=np.int32)
-
-    for lbl in range(1, kmax + 1):
-        m = (prompt_int_zyx == lbl)
-        if not m.any():
-            continue
-        m_d = ndi.binary_dilation(m, structure=se)
-        out[m_d] = lbl
-
-    return out
-# ============================================================
 
 
 def bbox_from_mask(mask_zyx: np.ndarray, margin: int):
@@ -319,7 +286,7 @@ def main():
     )
 
     viewer.layers.selection.active = prompt_layer
-    prompt_layer.brush_size = 2
+    prompt_layer.brush_size = 4          # ✅ match your napari training usage
     prompt_layer.selected_label = 1
 
     @magicgui(
@@ -328,14 +295,12 @@ def main():
         clear_prompt={"label": "Clear prompt"},
         selected_label={"label": "Selected prompt label", "min": 0, "max": KMAX},
         margin={"label": "ROI margin (vox)", "min": 0, "max": 256},
-        dilate_radius={"label": "Dilate prompt radius (vox)", "min": 0, "max": 12},
     )
     def controls(
         selected_label: int = 1,
         show_prob: bool = False,
         clear_prompt: bool = False,
         margin: int = PROMPT_MARGIN,
-        dilate_radius: int = DEFAULT_DILATE_RADIUS,
     ):
         show_info("Inference button clicked")
         log(">>> BUTTON CLICKED <<<")
@@ -355,21 +320,20 @@ def main():
 
         pr = prompt_layer.data.astype(np.int32)
 
-        # ===== FIX 1 applied here =====
-        pr_dil = dilate_prompts_per_label(pr, KMAX, radius=int(dilate_radius))
-        # =============================
+        # ✅ No dilation: use prompts exactly as painted (match training)
+        pr_used = pr
 
         # --- DEBUG ---
-        u, c = np.unique(pr_dil, return_counts=True)
-        log(f"PROMPT(unique, after dilation): {list(zip(u.tolist(), c.tolist()))}")
-        oh = prompt_int_to_onehot(pr_dil, KMAX)
-        log(f"prompt sum per channel (after dilation): {[float(oh[i].sum()) for i in range(KMAX)]}")
+        u, c = np.unique(pr_used, return_counts=True)
+        log(f"PROMPT(unique): {list(zip(u.tolist(), c.tolist()))}")
+        oh = prompt_int_to_onehot(pr_used, KMAX)
+        log(f"prompt sum per channel: {[float(oh[i].sum()) for i in range(KMAX)]}")
         # -----------
 
         pred, fg_prob = run_prompt_roi_inference(
             model=model,
             ct_zyx=ct_zyx,
-            prompt_int_zyx=pr_dil,
+            prompt_int_zyx=pr_used,
             device=device,
             kmax=KMAX,
             margin=int(margin),

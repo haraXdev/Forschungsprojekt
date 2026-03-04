@@ -1,2 +1,14 @@
 === debug log created at startup ===
 Using device: cpu
+>>> BUTTON CLICKED <<<
+PROMPT(unique): [(0, 16776838), (2, 105), (3, 147), (4, 126)]
+prompt sum per channel: [0.0, 105.0, 147.0, 126.0, 0.0, 0.0, 0.0, 0.0]
+PRED unique: [0, 2, 3, 4]
+>>> BUTTON CLICKED <<<
+PROMPT(unique): [(0, 16776775), (2, 105), (3, 147), (4, 189)]
+prompt sum per channel: [0.0, 105.0, 147.0, 189.0, 0.0, 0.0, 0.0, 0.0]
+PRED unique: [0, 2, 3, 4]
+>>> BUTTON CLICKED <<<
+PROMPT(unique): [(0, 16776733), (2, 105), (3, 147), (4, 231)]
+prompt sum per channel: [0.0, 105.0, 147.0, 231.0, 0.0, 0.0, 0.0, 0.0]
+PRED unique: [0, 2, 3, 4]
