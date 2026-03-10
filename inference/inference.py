@@ -29,8 +29,8 @@ from napari.utils.notifications import show_info
 # ============================================================
 # CONFIG
 # ============================================================
-MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_epoch_300.pth")
-INPUT_IMAGE_PATH      = Path(r"C:/uniDev/fProject/inference/image/case_0005_0000.nii")
+MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_best.pth")
+INPUT_IMAGE_PATH      = Path(r"C:/uniDev/fProject/inference/image/case_0159_0000.nii")
 
 KMAX = 8
 PATCH_SIZE = (64, 64, 64)      # must match training patch_size
