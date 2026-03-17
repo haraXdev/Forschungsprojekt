@@ -1,0 +1,49 @@
+{
+  "case_0000": {
+    "num_objects": 3,
+    "materials_used": [
+      "copper",
+      "titanium",
+      "copper"
+    ],
+    "timestamp": "2026-03-10T17:05:34.276647+00:00"
+  },
+  "case_0001": {
+    "num_objects": 5,
+    "materials_used": [
+      "plastic",
+      "steel",
+      "steel",
+      "plastic",
+      "plastic"
+    ],
+    "timestamp": "2026-03-10T17:05:46.762860+00:00"
+  },
+  "case_0002": {
+    "num_objects": 3,
+    "materials_used": [
+      "copper",
+      "steel",
+      "plastic"
+    ],
+    "timestamp": "2026-03-10T17:05:44.043640+00:00"
+  },
+  "case_0003": {
+    "num_objects": 4,
+    "materials_used": [
+      "copper",
+      "titanium",
+      "copper",
+      "ceramic"
+    ],
+    "timestamp": "2026-03-10T17:05:37.880768+00:00"
+  },
+  "case_0004": {
+    "num_objects": 2,
+    "materials_used": [
+      "plastic",
+      "titanium"
+    ],
+    "timestamp": "2026-03-10T17:05:03.695448+00:00"
+  }
+}

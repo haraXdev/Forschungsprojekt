@@ -1,43 +1,12 @@
 """
-trainer_interactive_labeled_prompts_unet.py
-
-Interactive trainer:
-
-Input:
-  - CT volume (1 channel)
-  - Prompt mask where user "clicks" / "scribbles" voxels and assigns LABEL IDs (1..K)
-    * Labels have NO global meaning across volumes.
-    * They are just IDs for "the region I prompted as label i" in THIS volume.
-
-Trainable formulation:
-  - Fix maximum number of interactive labels: KMAX (default 8).
-  - Convert integer prompt mask into KMAX one-hot channels.
-  - Model input channels = 1 + KMAX.
-
-Output:
-  - Multi-class segmentation with (KMAX + 1) channels:
-      0 = background
-      1..KMAX = prompted regions
-
-Loss:
-  - DiceCE (multi-class) over dense target
-  - Prompt consistency CE loss on ONLY prompted voxels
-
-LR schedule:
-  - ReduceLROnPlateau monitored on validation loss (minimize).
-
-TensorBoard:
-  - logs train loss, val loss, val dice, and learning rate (lr).
-
-Run:
-  python trainer_interactive_labeled_prompts_unet.py
+trainer_interactive_labeled_prompts_unet_zarr.py
 """
 
 import os
-import glob
+os.environ["ZARR_V3_EXPERIMENTAL_API"] = "1"
 import random
-import re
 import numpy as np
+import zarr
 from torch.utils.tensorboard import SummaryWriter
 
 import torch
@@ -46,9 +15,8 @@ from torch.utils.data import DataLoader
 
 from monai.transforms import (
     Compose,
-    LoadImaged,
+    MapTransform,
     EnsureChannelFirstd,
-    Orientationd,
     EnsureTyped,
     ScaleIntensityd,
     CropForegroundd,
@@ -57,7 +25,7 @@ from monai.transforms import (
     RandFlipd,
     RandRotate90d,
 )
-from monai.data import CacheDataset, list_data_collate
+from monai.data import Dataset, list_data_collate
 from monai.networks.nets import UNet
 from monai.losses import DiceCELoss
 
@@ -72,36 +40,51 @@ def set_seed(seed: int = 0):
     torch.cuda.manual_seed_all(seed)
 
 
-def make_pairs(images_dir, labels_dir):
-    imgs = sorted(glob.glob(os.path.join(images_dir, "*.nii*")))
-    if len(imgs) == 0:
-        raise RuntimeError(f"No NIfTI files found in {images_dir}")
+def make_pairs(data_root):
+    case_folders = [
+        os.path.join(data_root, d)
+        for d in sorted(os.listdir(data_root))
+        if os.path.isdir(os.path.join(data_root, d))
+    ]
+
+    if len(case_folders) == 0:
+        raise RuntimeError(f"No case folders found in {data_root}")
 
     data = []
-    for img in imgs:
-        base = os.path.basename(img)
+    for case_folder in case_folders:
+        case_path = os.path.join(case_folder, "data.zarr")
 
-        # remove ONLY the final "_0000" (or "_0001", etc.) before the extension
-        label_base = re.sub(r'_\d{4}(?=\.nii(\.gz)?$)', '', base)
-        lbl = os.path.join(labels_dir, label_base)
+        if not os.path.isdir(case_path):
+            raise RuntimeError(f"Missing data.zarr in {case_folder}")
 
-        data.append({"image": img, "label": lbl})
+        print(f"Loading case: {case_path}")
+
+        
+        store = zarr.open_group(case_path, mode="r", zarr_version=3)
+
+        ct_vol  = store["input"][:].astype(np.float32)
+        lbl_vol = store["label"][:].astype(np.int64)
+
+        print("  image shape:", ct_vol.shape, "dtype:", ct_vol.dtype)
+        print("  label shape:", lbl_vol.shape, "dtype:", lbl_vol.dtype)
+
+        data.append({
+            "image": ct_vol,
+            "label": lbl_vol,
+            "case_path": case_path,
+        })
+
     return data
 
 
 def draw_napari_click_u8(
     mask_u8: np.ndarray,
     center_zyx,
-    brush_size: int = 4,     # UI brush size (diameter)
-    z_thickness: int = 0,    # 0 = only current slice
-    jitter: float = 0.2,     # subpixel jitter in px
-    fray: float = 0.08,      # boundary fraying
+    brush_size: int = 4,
+    z_thickness: int = 0,
+    jitter: float = 0.2,
+    fray: float = 0.08,
 ):
-    """
-    Napari-like brush click: 2D disk in slice, optionally across +/- z_thickness slices.
-    mask_u8: (D,H,W) uint8, written in-place with 1s.
-    center_zyx: (z,y,x) int or float
-    """
     D, H, W = mask_u8.shape
     cz, cy, cx = center_zyx
 
@@ -145,9 +128,6 @@ def _disk_offsets(radius: float):
 
 
 def _paint_disk_on_slice(mask_u8: np.ndarray, z: int, y: float, x: float, radius: float):
-    """
-    Paint a disk into mask_u8[z] centered at (y, x).
-    """
     D, H, W = mask_u8.shape
     z = int(z)
     if not (0 <= z < D):
@@ -175,20 +155,6 @@ def _sample_large_slice_for_part(
     min_area_ratio: float = 0.6,
     temperature: float = 1.2,
 ):
-    """
-    part_mask: (D,H,W) bool
-
-    Returns a slice z sampled from the set of "large" slices, not always the largest one.
-
-    min_area_ratio:
-        only consider slices whose area is at least
-        min_area_ratio * max_slice_area
-
-    temperature:
-        controls how strongly sampling prefers larger slices
-        lower  -> more preference for largest
-        higher -> more uniform among large slices
-    """
     areas = part_mask.sum(axis=(1, 2)).astype(np.float32)
     max_area = areas.max()
     if max_area <= 0:
@@ -220,12 +186,6 @@ def draw_scribble_u8_on_part(
     min_area_ratio: float = 0.6,
     slice_temperature: float = 1.2,
 ):
-    """
-    Simulate a small user scribble on a large visible surface of a 3D object.
-
-    The slice is sampled from large-area slices, not always the single largest one.
-    Scribble stays inside the object and is intentionally short/irregular to mimic user input.
-    """
     D, H, W = mask_u8.shape
     _ = D, H, W
     part_mask = part_mask.astype(bool)
@@ -301,14 +261,6 @@ def simulate_prompt_and_target_from_parts(
     scribble_min_area_ratio: float = 0.6,
     scribble_slice_temperature: float = 1.2,
 ):
-    """
-    parts_label_1dhw: (1,D,H,W) int. 0=bg, 1..N parts
-
-    Returns:
-      prompt_onehot: (kmax, D, H, W) float {0,1}
-      target_int:    (D, H, W) long in [0..kmax] (dense training target)
-      prompt_int:    (D, H, W) long in [0..kmax] (sparse prompt IDs at prompted voxels)
-    """
     lbl = parts_label_1dhw[0].detach().cpu().numpy().astype(np.int32)
 
     part_ids = np.unique(lbl)
@@ -344,7 +296,6 @@ def simulate_prompt_and_target_from_parts(
         if vox.shape[0] == 0:
             continue
 
-        # clicks
         n_clicks = np.random.randint(clicks_per_label[0], clicks_per_label[1] + 1)
         for _ in range(n_clicks):
             cz, cy, cx = vox[np.random.randint(vox.shape[0])]
@@ -357,7 +308,6 @@ def simulate_prompt_and_target_from_parts(
             tmp = tmp & part_mask.astype(np.uint8)
             prompt_int[tmp > 0] = new_id
 
-        # scribble
         if np.random.rand() < scribble_prob:
             tmp = np.zeros((D, H, W), dtype=np.uint8)
             draw_scribble_u8_on_part(
@@ -388,12 +338,6 @@ def prompt_click_consistency_ce(
     logits: torch.Tensor,
     prompt_int: torch.Tensor,
 ):
-    """
-    Enforce that on prompted voxels the predicted class matches the prompt ID.
-
-    logits:     (B, C, D, H, W) where C = kmax+1
-    prompt_int: (B, D, H, W) long in [0..kmax], sparse (>0 only at prompted voxels)
-    """
     m = prompt_int > 0
     if not m.any():
         return logits.new_tensor(0.0)
@@ -420,7 +364,6 @@ def train(
     save_every: int = 25,
     val_every: int = 10,
     prompt_ce_w: float = 0.5,
-    # prompt simulation
     clicks_per_label=(3, 6),
     brush_size: int = 4,
     p_empty: float = 0.05,
@@ -429,7 +372,6 @@ def train(
     scribble_step_range=(2.0, 4.0),
     scribble_min_area_ratio: float = 0.6,
     scribble_slice_temperature: float = 1.2,
-    # ReduceLROnPlateau
     lr_factor: float = 0.5,
     lr_patience: int = 3,
     lr_min: float = 1e-6,
@@ -454,7 +396,7 @@ def train(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
 
-    files = make_pairs(os.path.join(data_root, "imagesTr"), os.path.join(data_root, "labelsTr"))
+    files = make_pairs(data_root)
     random.shuffle(files)
 
     if len(files) < 2:
@@ -469,24 +411,23 @@ def train(
     print(f"KMAX={kmax} -> in_channels={1 + kmax}, out_channels={1 + kmax}")
 
     tf = Compose([
-        LoadImaged(keys=["image", "label"]),
-        EnsureChannelFirstd(keys=["image", "label"]),
-        Orientationd(keys=["image", "label"], axcodes="RAS"),
-        ScaleIntensityd(keys=["image"]),
-        EnsureTyped(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"], channel_dim="no_channel"),
+    ScaleIntensityd(keys=["image"]),
+    EnsureTyped(keys=["image"], dtype=torch.float32),
+    EnsureTyped(keys=["label"], dtype=torch.int64),
 
-        CropForegroundd(keys=["image", "label"], source_key="label"),
-        SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
-        CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size),
+    CropForegroundd(keys=["image", "label"], source_key="label"),
+    SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
+    CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size),
 
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
-        RandRotate90d(keys=["image", "label"], prob=0.25, max_k=3),
-    ])
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+    RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
+    RandRotate90d(keys=["image", "label"], prob=0.25, max_k=3),
+])
 
-    train_ds = CacheDataset(train_files, transform=tf, cache_rate=cache_rate, num_workers=0)
-    val_ds = CacheDataset(val_files, transform=tf, cache_rate=cache_rate, num_workers=0)
+    train_ds = Dataset(train_files, transform=tf)
+    val_ds = Dataset(val_files, transform=tf)
 
     train_loader = DataLoader(
         train_ds,
@@ -536,7 +477,6 @@ def train(
     best_val = -1.0
 
     for epoch in range(1, epochs + 1):
-        # ---------- TRAIN ----------
         model.train()
         train_loss_sum = 0.0
 
@@ -610,7 +550,6 @@ def train(
         mean_dice_fg = None
         mean_val_loss = None
 
-        # ---------- VAL ----------
         if (epoch % val_every) == 0:
             model.eval()
             val_loss_sum = 0.0
@@ -681,7 +620,6 @@ def train(
             msg += f" | val_loss={mean_val_loss:.4f} | val_fg_union_dice={mean_dice_fg:.4f}"
         print(msg)
 
-        # ---------- SAVE ----------
         if (epoch % save_every) == 0 or epoch == epochs:
             ckpt_path = os.path.join(out_dir, f"model_epoch_{epoch:03d}.pth")
             torch.save(model.state_dict(), ckpt_path)
@@ -696,17 +634,14 @@ def train(
     writer.close()
 
 
-# data_root=r"/lgrp/edu-2025-2-brprj-segmentation/Forschungsprojekt/trainingsdata/Datasets/Dataset001_CT_Scans"
-# data_root=r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset001_CADSynthetic"
-
 if __name__ == "__main__":
     train(
-        data_root=r"C:/uniDev/fProject/trainingsdata/nnUNet_raw/Dataset002_CADSynthetic",
+        data_root=r"C:/uniDev/fProject/trainingsdata/Dataset003_CT_Scans",
         out_dir=r"./runs_clickprompts",
         kmax=8,
         patch_size=(64, 64, 64),
         batch_size=1,
-        epochs=500,  # 500 EPOCH !!!!
+        epochs=500,
         lr=1e-3,
         device="cuda" if torch.cuda.is_available() else "cpu",
         cache_rate=1,
@@ -714,8 +649,6 @@ if __name__ == "__main__":
         save_every=25,
         val_every=10,
         prompt_ce_w=0.5,
-
-        # prompt simulation
         clicks_per_label=(3, 6),
         brush_size=4,
         p_empty=0.05,
@@ -724,8 +657,6 @@ if __name__ == "__main__":
         scribble_step_range=(2.0, 4.0),
         scribble_min_area_ratio=0.6,
         scribble_slice_temperature=1.2,
-
-        # ReduceLROnPlateau tuning
         lr_factor=0.5,
         lr_patience=3,
         lr_min=1e-6,

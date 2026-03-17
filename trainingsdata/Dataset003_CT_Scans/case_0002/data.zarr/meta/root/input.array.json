@@ -1,0 +1,30 @@
+{
+    "attributes": {},
+    "chunk_grid": {
+        "chunk_shape": [
+            64,
+            64,
+            64
+        ],
+        "separator": "/",
+        "type": "regular"
+    },
+    "chunk_memory_layout": "C",
+    "compressor": {
+        "codec": "https://purl.org/zarr/spec/codec/blosc/1.0",
+        "configuration": {
+            "blocksize": 0,
+            "clevel": 3,
+            "cname": "zstd",
+            "shuffle": 2
+        }
+    },
+    "data_type": "<f4",
+    "extensions": [],
+    "fill_value": 0.0,
+    "shape": [
+        256,
+        256,
+        256
+    ]
+}
