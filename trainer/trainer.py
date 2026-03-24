@@ -636,7 +636,7 @@ def train(
 
 if __name__ == "__main__":
     train(
-        data_root=r"C:/uniDev/fProject/trainingsdata/Dataset003_CT_Scans",
+        data_root=r"/lgrp/edu-2025-2-brprj-segmentation/Forschungsprojekt/trainingsdata/Datasets/Dataset002_CT_Scans",
         out_dir=r"./runs_clickprompts",
         kmax=8,
         patch_size=(64, 64, 64),
