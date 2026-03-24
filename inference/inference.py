@@ -1,28 +1,30 @@
 import os
+os.environ["ZARR_V3_EXPERIMENTAL_API"] = "1"
+
 from pathlib import Path
 
 # ============================================================
-# HARD STARTUP DEBUG (to prove which file is running + where)
+# HARD STARTUP DEBUG
 # ============================================================
-print("=== START inference.py (UPDATED DEBUG) ===", flush=True)
+print("=== START inference.py (ZARR + NIFTI SUPPORT) ===", flush=True)
 print("SCRIPT PATH:", Path(__file__).resolve(), flush=True)
 print("CWD:", Path.cwd().resolve(), flush=True)
 
-# Force debug log to live NEXT TO THIS SCRIPT (absolute path)
 DEBUG_LOG_PATH = Path(__file__).resolve().parent / "debug_log.txt"
 DEBUG_LOG_PATH.write_text("=== debug log created at startup ===\n", encoding="utf-8")
 print("DEBUG_LOG_PATH:", DEBUG_LOG_PATH, flush=True)
-# ============================================================Change
+# ============================================================
 
 import numpy as np
 import torch
 import napari
-from magicgui import magicgui
 import nibabel as nib
+import zarr
+
+from magicgui import magicgui
 
 from monai.networks.nets import UNet
 from monai.inferers import sliding_window_inference
-
 from napari.utils.notifications import show_info
 
 
@@ -30,16 +32,20 @@ from napari.utils.notifications import show_info
 # CONFIG
 # ============================================================
 MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_best.pth")
-INPUT_IMAGE_PATH      = Path(r"C:/uniDev/fProject/inference/image/case_0159_0000.nii")
+
+# You can set this to:
+# - a .nii / .nii.gz file
+# - a data.zarr folder
+# - a case folder that contains data.zarr
+INPUT_IMAGE_PATH = Path(r"C:/uniDev/fProject/trainingsdata/Dataset003_CT_Scans/case_0000/data.zarr")
 
 KMAX = 8
-PATCH_SIZE = (64, 64, 64)      # must match training patch_size
-SW_BATCH_SIZE = 2              # adjust for your VRAM
-OVERLAP = 0.25                 # typical
+PATCH_SIZE = (64, 64, 64)   # must match training
+SW_BATCH_SIZE = 2
+OVERLAP = 0.25
 FORCE_CPU = False
 
-# Prompt-ROI settings
-PROMPT_MARGIN = 24             # voxels around prompts
+PROMPT_MARGIN = 24
 # ============================================================
 
 
@@ -63,14 +69,12 @@ def build_model(kmax: int = 8):
 def load_state_dict_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: torch.device):
     state = torch.load(str(ckpt_path), map_location=device)
 
-    # allow nested formats
     if isinstance(state, dict):
         for key in ["state_dict", "model_state_dict", "model", "net", "network"]:
             if key in state and isinstance(state[key], dict):
                 state = state[key]
                 break
 
-    # strip common outer prefixes if present
     cleaned = {}
     for k, v in state.items():
         for prefix in ["model.", "net.", "network."]:
@@ -78,10 +82,9 @@ def load_state_dict_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: 
                 k = k[len(prefix):]
         cleaned[k] = v
 
-    # ---- AUTO-FIX PREFIX MISMATCH ----
     model_keys = list(model.state_dict().keys())
     if not model_keys:
-        raise RuntimeError("Model has no state_dict keys?")
+        raise RuntimeError("Model has no state_dict keys.")
 
     expects_model_prefix = model_keys[0].startswith("model.")
     ckpt_has_model_prefix = next(iter(cleaned.keys())).startswith("model.")
@@ -102,14 +105,6 @@ def load_state_dict_checkpoint(model: torch.nn.Module, ckpt_path: Path, device: 
     return model
 
 
-def load_nifti_as_ras_zyx(path: Path) -> np.ndarray:
-    img = nib.load(str(path))
-    img = nib.as_closest_canonical(img)
-    vol_xyz = img.get_fdata().astype(np.float32)   # (X,Y,Z)
-    vol_zyx = np.transpose(vol_xyz, (2, 1, 0))     # (Z,Y,X)
-    return vol_zyx
-
-
 def scale_intensity_minmax_like_monai(vol: np.ndarray) -> np.ndarray:
     vmin = float(np.min(vol))
     vmax = float(np.max(vol))
@@ -117,6 +112,80 @@ def scale_intensity_minmax_like_monai(vol: np.ndarray) -> np.ndarray:
         return np.zeros_like(vol, dtype=np.float32)
     out = (vol - vmin) / (vmax - vmin)
     return out.astype(np.float32)
+
+
+def resolve_input_path(path: Path) -> Path:
+    """
+    Accepts:
+      - .nii / .nii.gz file
+      - data.zarr directory
+      - case directory that contains data.zarr
+    """
+    path = path.resolve()
+
+    if path.is_file():
+        return path
+
+    if path.is_dir():
+        if path.name.endswith(".zarr"):
+            return path
+
+        candidate = path / "data.zarr"
+        if candidate.is_dir():
+            return candidate
+
+    raise FileNotFoundError(
+        f"Could not resolve input path: {path}\n"
+        f"Expected a .nii/.nii.gz file, a data.zarr folder, or a case folder containing data.zarr."
+    )
+
+
+def load_nifti_as_ras_zyx(path: Path) -> np.ndarray:
+    img = nib.load(str(path))
+    img = nib.as_closest_canonical(img)
+    vol_xyz = img.get_fdata().astype(np.float32)   # (X,Y,Z)
+    vol_zyx = np.transpose(vol_xyz, (2, 1, 0))     # -> (Z,Y,X)
+    return vol_zyx
+
+
+def load_zarr_input_zyx(path: Path) -> np.ndarray:
+    """
+    Matches training loader behavior:
+        store = zarr.open_group(case_path, mode="r", zarr_version=3)
+        ct_vol = store["input"][:].astype(np.float32)
+
+    Expected output shape: (Z,Y,X) or generally same raw shape used in training.
+    """
+    store = zarr.open_group(str(path), mode="r", zarr_version=3)
+
+    if "input" not in store:
+        raise KeyError(f"'input' dataset not found in Zarr group: {path}")
+
+    vol = store["input"][:].astype(np.float32)
+
+    if vol.ndim != 3:
+        raise RuntimeError(f"Expected Zarr input volume with 3 dims, got shape {vol.shape}")
+
+    return vol
+
+
+def load_input_volume(path: Path) -> np.ndarray:
+    resolved = resolve_input_path(path)
+    log(f"Resolved input path: {resolved}")
+
+    name_lower = resolved.name.lower()
+
+    if name_lower.endswith(".zarr"):
+        vol = load_zarr_input_zyx(resolved)
+        log(f"Loaded Zarr volume with shape {vol.shape}, dtype={vol.dtype}")
+        return vol
+
+    if name_lower.endswith(".nii") or name_lower.endswith(".nii.gz"):
+        vol = load_nifti_as_ras_zyx(resolved)
+        log(f"Loaded NIfTI volume with shape {vol.shape}, dtype={vol.dtype}")
+        return vol
+
+    raise RuntimeError(f"Unsupported input format: {resolved}")
 
 
 def prompt_int_to_onehot(prompt_int_zyx: np.ndarray, kmax: int) -> np.ndarray:
@@ -130,6 +199,7 @@ def bbox_from_mask(mask_zyx: np.ndarray, margin: int):
     zs, ys, xs = np.where(mask_zyx > 0)
     if zs.size == 0:
         return None
+
     z0, z1 = int(zs.min()), int(zs.max()) + 1
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
@@ -188,30 +258,25 @@ def run_model_sliding_window(
         mode="gaussian",
         padding_mode="constant",
         cval=0.0,
-    )  # (1, C, Z, Y, X) where C = 1+kmax
+    )  # (1, C, Z, Y, X)
 
     probs = torch.softmax(logits, dim=1)[0]  # (C, Z, Y, X)
 
-    # ------------------------------------------------------------
-    # Restrict predictions to {background + prompted labels}
-    # ------------------------------------------------------------
     present = np.unique(prompt_int_zyx)
-    present = present[present > 0]  # only prompted label IDs
+    present = present[present > 0]
     allowed = np.concatenate([[0], present]).astype(np.int64)
 
-    probs_np = probs.detach().cpu().numpy().astype(np.float32)  # (C,Z,Y,X)
+    probs_np = probs.detach().cpu().numpy().astype(np.float32)
     keep = np.zeros((kmax + 1,), dtype=bool)
     keep[allowed] = True
     probs_np[~keep, ...] = 0.0
 
-    pred = np.argmax(probs_np, axis=0).astype(np.int32)  # (Z,Y,X)
+    pred = np.argmax(probs_np, axis=0).astype(np.int32)
 
-    # enforce prompt voxels exactly (recommended)
     m = prompt_int_zyx > 0
     pred[m] = prompt_int_zyx[m]
-    # ------------------------------------------------------------
 
-    p_bg = probs_np[0]  # (Z,Y,X)
+    p_bg = probs_np[0]
     fg_prob = (1.0 - p_bg).astype(np.float32)
     return pred, fg_prob
 
@@ -257,18 +322,16 @@ def main():
 
     if not MODEL_CHECKPOINT_PATH.exists():
         raise FileNotFoundError(MODEL_CHECKPOINT_PATH)
-    if not INPUT_IMAGE_PATH.exists():
-        raise FileNotFoundError(INPUT_IMAGE_PATH)
 
-    ct_zyx = load_nifti_as_ras_zyx(INPUT_IMAGE_PATH)
+    ct_zyx = load_input_volume(INPUT_IMAGE_PATH)
     ct_zyx = scale_intensity_minmax_like_monai(ct_zyx)
     prompt_zyx = np.zeros_like(ct_zyx, dtype=np.int32)
 
     model = build_model(KMAX)
     model = load_state_dict_checkpoint(model, MODEL_CHECKPOINT_PATH, device)
 
-    viewer = napari.Viewer(title="Interactive Click-Prompt UNet (Prompt-ROI Inference)")
-    viewer.add_image(ct_zyx, name="ct (RAS canonical, ZYX)", contrast_limits=(0, 1))
+    viewer = napari.Viewer(title="Interactive Click-Prompt UNet (Zarr/NIfTI Inference)")
+    viewer.add_image(ct_zyx, name="ct (ZYX)", contrast_limits=(0, 1))
 
     prompt_layer = viewer.add_labels(prompt_zyx, name="prompt")
 
@@ -286,7 +349,7 @@ def main():
     )
 
     viewer.layers.selection.active = prompt_layer
-    prompt_layer.brush_size = 4          # ✅ match your napari training usage
+    prompt_layer.brush_size = 4
     prompt_layer.selected_label = 1
 
     @magicgui(
@@ -319,16 +382,12 @@ def main():
             return
 
         pr = prompt_layer.data.astype(np.int32)
-
-        # ✅ No dilation: use prompts exactly as painted (match training)
         pr_used = pr
 
-        # --- DEBUG ---
         u, c = np.unique(pr_used, return_counts=True)
         log(f"PROMPT(unique): {list(zip(u.tolist(), c.tolist()))}")
         oh = prompt_int_to_onehot(pr_used, KMAX)
         log(f"prompt sum per channel: {[float(oh[i].sum()) for i in range(KMAX)]}")
-        # -----------
 
         pred, fg_prob = run_prompt_roi_inference(
             model=model,
