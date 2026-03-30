@@ -37,7 +37,7 @@ MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_best.pth
 # - a .nii / .nii.gz file
 # - a data.zarr folder
 # - a case folder that contains data.zarr
-INPUT_IMAGE_PATH = Path(r"C:/uniDev/fProject/trainingsdata/Dataset003_CT_Scans/case_0000/data.zarr")
+INPUT_IMAGE_PATH = Path(r"C:/uniDev/fProject/inference/image/data.zarr")
 
 KMAX = 8
 PATCH_SIZE = (64, 64, 64)   # must match training

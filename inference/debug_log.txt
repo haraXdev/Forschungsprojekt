@@ -1,8 +1,3 @@
 === debug log created at startup ===
 Using device: cpu
-Resolved input path: C:\uniDev\fProject\trainingsdata\Dataset003_CT_Scans\case_0000\data.zarr
-Loaded Zarr volume with shape (256, 256, 256), dtype=float32
->>> BUTTON CLICKED <<<
-PROMPT(unique): [(0, 16776151), (2, 659), (3, 406)]
-prompt sum per channel: [0.0, 659.0, 406.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-PRED unique: [0, 2, 3]
+Resolved input path: C:\uniDev\fProject\inference\image\data.zarr
