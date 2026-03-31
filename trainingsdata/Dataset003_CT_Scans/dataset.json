@@ -1,0 +1,17 @@
+{
+  "name": "CT_Scans",
+  "tensorImageSize": "3D",
+  "channel_names": {
+    "0": "CT"
+  },
+  "labels": {
+    "background": 0,
+    "part_01": 1,
+    "part_02": 2,
+    "part_03": 3,
+    "part_04": 4,
+    "part_05": 5
+  },
+  "numTraining": 5,
+  "file_ending": ".zarr"
+}

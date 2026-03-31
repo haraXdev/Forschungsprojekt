@@ -4,3 +4,7 @@ trainer/runs_clickprompts/
 # Training data (CADs + nnU-Net output)
 trainingsdata/cads/
 trainingsdata/nnUNet_raw/
+
+inference/image/
+inference/model/
+trainingsdata/

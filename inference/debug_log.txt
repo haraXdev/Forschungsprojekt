@@ -1,0 +1,3 @@
+=== debug log created at startup ===
+Using device: cpu
+Resolved input path: C:\uniDev\fProject\inference\image\data.zarr
