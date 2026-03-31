@@ -33,10 +33,6 @@ from napari.utils.notifications import show_info
 # ============================================================
 MODEL_CHECKPOINT_PATH = Path(r"C:/uniDev/fProject/inference/model/model_best.pth")
 
-# You can set this to:
-# - a .nii / .nii.gz file
-# - a data.zarr folder
-# - a case folder that contains data.zarr
 INPUT_IMAGE_PATH = Path(r"C:/uniDev/fProject/inference/image/data.zarr")
 
 KMAX = 8
